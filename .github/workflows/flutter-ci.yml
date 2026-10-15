@@ -12,12 +12,6 @@ on:
       - 'Cargo.lock'
       - 'flutter/**'
       - '.github/workflows/flutter-ci.yml'
-    paths-ignore:
-      - "docs/**"
-      - "README.md"
-      - "res/**"
-      - "appimage/**"
-      - "flatpak/**"
 
   workflow_dispatch:
   pull_request:
