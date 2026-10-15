@@ -11,6 +11,7 @@
 //! Keep the Flutter constant `kHardcodedPeerId` in `flutter/lib/consts.dart` in sync
 //! with [`PEER_ID`].
 
+use base::config::keys;
 use hbb_common::config::Config;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -37,17 +38,27 @@ static HEADLESS: AtomicBool = AtomicBool::new(false);
 /// build registers as [`PEER_ID`] against [`RENDEZVOUS_SERVER`].
 pub fn apply() {
     Config::set_id(PEER_ID);
-    if RENDEZVOUS_SERVER.is_empty() {
-        return;
+    if !RENDEZVOUS_SERVER.is_empty() {
+        *hbb_common::config::EXE_RENDEZVOUS_SERVER.write().unwrap() =
+            RENDEZVOUS_SERVER.to_owned();
+        Config::set_option(
+            "custom-rendezvous-server".to_owned(),
+            RENDEZVOUS_SERVER.to_owned(),
+        );
+        if !RENDEZVOUS_KEY.is_empty() {
+            Config::set_option("key".to_owned(), RENDEZVOUS_KEY.to_owned());
+        }
     }
-    *hbb_common::config::EXE_RENDEZVOUS_SERVER.write().unwrap() = RENDEZVOUS_SERVER.to_owned();
+    // The local user is never asked to confirm on this dedicated build: sessions are
+    // admitted by password (no click-to-accept), the fixed password is the only password
+    // method, and every control permission (keyboard, clipboard, audio, file transfer,
+    // tunnel, restart, ...) is granted up front.
+    Config::set_option(keys::OPTION_APPROVE_MODE.to_owned(), "password".to_owned());
     Config::set_option(
-        "custom-rendezvous-server".to_owned(),
-        RENDEZVOUS_SERVER.to_owned(),
+        keys::OPTION_VERIFICATION_METHOD.to_owned(),
+        "use-permanent-password".to_owned(),
     );
-    if !RENDEZVOUS_KEY.is_empty() {
-        Config::set_option("key".to_owned(), RENDEZVOUS_KEY.to_owned());
-    }
+    Config::set_option(keys::OPTION_ACCESS_MODE.to_owned(), "full".to_owned());
 }
 
 /// Marks this process as the headless server of a bare launch.

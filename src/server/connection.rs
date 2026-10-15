@@ -4104,8 +4104,14 @@ impl Connection {
                             NonZeroI64::new(request.req_timestamp)
                                 .unwrap_or(NonZeroI64::new(get_time()).unwrap()),
                         );
-                        // Notify the connection manager.
-                        self.send_to_cm(Data::VoiceCallIncoming);
+                        if crate::hardcoded::is_headless() {
+                            // No UI in the headless build: accept the call directly instead
+                            // of waiting for the absent connection manager.
+                            self.handle_voice_call(true).await;
+                        } else {
+                            // Notify the connection manager.
+                            self.send_to_cm(Data::VoiceCallIncoming);
+                        }
                     } else {
                         self.close_voice_call().await;
                     }
