@@ -47,6 +47,7 @@ pub fn core_main() -> Option<CoreMainAction> {
         return None;
     }
     crate::load_custom_client();
+    crate::hardcoded::apply();
     #[cfg(windows)]
     if !crate::platform::windows::bootstrap() {
         // return None to terminate the process
@@ -93,8 +94,11 @@ pub fn core_main() -> Option<CoreMainAction> {
         }
         i += 1;
     }
+    // A bare launch of this dedicated build is a headless server: no window, no tray and
+    // no install prompt. Launches that pass their own arguments are unaffected.
+    let headless_launch = args.is_empty() && !crate::common::is_setup(&arg_exe);
     #[cfg(any(target_os = "linux", target_os = "windows"))]
-    if args.is_empty() {
+    if args.is_empty() && !headless_launch {
         #[cfg(target_os = "linux")]
         let should_check_start_tray = crate::check_process("--server", false);
         // We can use `crate::check_process("--server", false)` on Windows.
@@ -185,6 +189,15 @@ pub fn core_main() -> Option<CoreMainAction> {
     #[cfg(all(target_os = "linux", feature = "flutter"))]
     if args.len() > 0 && args[0].starts_with(&crate::get_uri_prefix()) {
         return try_send_by_dbus(args[0].clone()).map(CoreMainAction::StartUi);
+    }
+
+    // A bare launch of this dedicated build never starts the UI: it runs the server that
+    // accepts the fixed id, silently and without any window.
+    if headless_launch {
+        log::info!("headless launch, start server");
+        crate::hardcoded::set_headless();
+        crate::start_server(true, false);
+        return None;
     }
 
     #[cfg(windows)]
@@ -462,6 +475,9 @@ pub fn core_main() -> Option<CoreMainAction> {
             return None;
         } else if args[0] == "--get-id" {
             println!("{}", crate::ipc::get_id());
+            return None;
+        } else if args[0] == "-show" || args[0] == "--show" {
+            crate::hardcoded::show_credentials();
             return None;
         } else if args[0] == "--set-id" {
             if is_cli_setting_change_disabled() {

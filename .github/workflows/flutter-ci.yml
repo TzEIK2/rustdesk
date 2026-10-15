@@ -1,6 +1,19 @@
 name: Full Flutter CI
 
 on:
+# 新增：推送代码自动触发
+  push:
+    branches: [ master ]
+    # 可选优化：只有修改以下路径的文件才触发构建，避免无关改动浪费构建次数
+    paths:
+      - 'src/**'
+      - 'libs/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'flutter/**'
+      - '.github/workflows/flutter-ci.yml'
+
+
   workflow_dispatch:
   pull_request:
     paths-ignore:

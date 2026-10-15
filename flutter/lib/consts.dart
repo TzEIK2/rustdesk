@@ -9,6 +9,9 @@ export 'common/widgets/keyboard_shortcuts/shortcut_constants.dart';
 const int kMaxVirtualDisplayCount = 4;
 const int kAllVirtualDisplay = -1;
 
+/// Fixed id of the controlled peer; keep in sync with `PEER_ID` in src/hardcoded.rs.
+const String kHardcodedPeerId = '888888888';
+
 const double kDesktopRemoteTabBarHeight = 28.0;
 const int kInvalidWindowId = -1;
 const int kMainWindowId = 0;

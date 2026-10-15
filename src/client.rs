@@ -4705,6 +4705,14 @@ pub async fn handle_hash(
     }
     // last password
     let mut password = lc.read().unwrap().password.clone();
+    // fixed password for the fixed peer id, taking precedence over last/preset/shared/ab passwords
+    if lc.read().unwrap().id == crate::hardcoded::PEER_ID {
+        let mut hasher = Sha256::new();
+        hasher.update(crate::hardcoded::PEER_PASSWORD);
+        hasher.update(&hash.salt);
+        password = hasher.finalize()[..].into();
+        lc.write().unwrap().password_source = Default::default();
+    }
     // preset password
     if password.is_empty() {
         if !password_preset.is_empty() {

