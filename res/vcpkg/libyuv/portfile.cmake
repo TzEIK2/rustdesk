@@ -1,10 +1,22 @@
 vcpkg_check_linkage(ONLY_STATIC_LIBRARY)
 
-vcpkg_from_git(
-    OUT_SOURCE_PATH SOURCE_PATH
-    URL https://chromium.googlesource.com/libyuv/libyuv
-    REF 0faf8dd0e004520a61a603a4d2996d5ecc80dc3f
-    # Check https://chromium.googlesource.com/libyuv/libyuv/+/refs/heads/main/include/libyuv/version.h for a version!
+# The upstream git host of libyuv, chromium.googlesource.com, is not reliably reachable from CI
+# runners: its `git fetch` aborts with HTTP 5xx there, the same failure aom hits on
+# aomedia.googlesource.com. Take the pinned tree as a GitHub mirror tarball instead. The mirror
+# holds the unmodified upstream tree, so the patch below still applies. The download is left
+# without a hash because GitHub regenerates its archives, which would eventually break a pinned
+# hash.
+vcpkg_download_distfile(
+    LIBYUV_ARCHIVE
+    URLS "https://github.com/lemenkov/libyuv/archive/0faf8dd0e004520a61a603a4d2996d5ecc80dc3f.tar.gz"
+    FILENAME "libyuv-0faf8dd0e004520a61a603a4d2996d5ecc80dc3f.tar.gz"
+    SKIP_SHA512
+)
+
+# Check https://chromium.googlesource.com/libyuv/libyuv/+/refs/heads/main/include/libyuv/version.h for a version!
+vcpkg_extract_source_archive(
+    SOURCE_PATH
+    ARCHIVE "${LIBYUV_ARCHIVE}"
     PATCHES
         fix-cmakelists.patch
 )

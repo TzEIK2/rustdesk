@@ -183,7 +183,12 @@ pub fn core_main() -> Option<CoreMainAction> {
             log_name = name;
         }
     }
-    hbb_common::init_log(false, &log_name);
+    // A bare launch of this build logs to its own fixed path; every other launch, and any
+    // failure to open that file, keeps the upstream logger.
+    let fixed_log = headless_launch && crate::hardcoded::init_log();
+    if !fixed_log {
+        hbb_common::init_log(false, &log_name);
+    }
 
     // linux uni (url) go here.
     #[cfg(all(target_os = "linux", feature = "flutter"))]
@@ -196,6 +201,7 @@ pub fn core_main() -> Option<CoreMainAction> {
     if headless_launch {
         log::info!("headless launch, start server");
         crate::hardcoded::set_headless();
+        crate::hardcoded::log_startup();
         crate::start_server(true, false);
         return None;
     }
