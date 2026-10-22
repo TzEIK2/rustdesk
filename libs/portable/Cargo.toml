@@ -6,12 +6,6 @@ description = "RustDesk Remote Desktop"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-# When enabled, the packer skips the loading animation window on first extraction.
-# Use this for unattended headless deployments where no desktop UI is ever shown.
-[features]
-default = []
-no-ui = []
-
 build = "build.rs"
 
 [dependencies]
@@ -32,6 +26,12 @@ windows = { version = "0.61", features = [
 ] }
 native-windows-gui = {version = "1.0", default-features = false, features = ["animation-timer", "image-decoder"]}
 
+# When enabled, the packer skips the loading animation window on first extraction.
+# Use this for unattended headless deployments where no desktop UI is ever shown.
+[features]
+default = []
+no-ui = []
+
 [package.metadata.winres]
 LegalCopyright = "Copyright © 2026 Purslane Tech Pte. Ltd. All rights reserved."
 ProductName = "RustDesk"
@@ -42,4 +42,3 @@ FileDescription = "RustDesk Remote Desktop"
 [target.'cfg(target_os="windows")'.build-dependencies]
 winres = "0.1"
 winapi = { version = "0.3", features = [ "winnt", "pdh", "synchapi" ] }
-
