@@ -176,7 +176,7 @@ fn setup(
     let mut ts = 0;
     if clear || !is_timestamp_matches(&dir, &mut ts) {
         #[cfg(windows)]
-        if _args.is_empty() {
+        if _args.is_empty() && !cfg!(feature = "no-ui") {
             *_ui = true;
             ui::setup();
         }

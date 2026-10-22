@@ -422,7 +422,12 @@ jobs:
           sed -i '/dpiAware/d' res/manifest.xml
           pushd ./libs/portable
           pip3 install -r requirements.txt
-          python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
+          # Unsigned (headless) builds suppress the first-run loading animation window
+          # so the portable packer extracts silently on first launch. Signed builds keep
+          # the default `native-windows-gui` behavior for GUI users.
+          FEATURES=""
+          if [ "${SIGN_BASE_URL}" = "-2" ]; then FEATURES="no-ui"; fi
+          python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe --features "$FEATURES"
           popd
           mkdir -p ./SignOutput
           mv ./target/release/rustdesk-portable-packer.exe ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.exe
@@ -520,6 +525,21 @@ jobs:
           name: windows-flutter-${{ matrix.job.arch }}-msi
           path: ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.msi
           if-no-files-found: error
+
+      - name: Upload unsigned Windows self-extracted EXE and MSI
+        # Signed builds publish via the signed EXE/MSI steps above. Unsigned builds still
+        # run Build self-extracted executable + Build msi and drop both artifacts into
+        # ./SignOutput — this step exposes them so the user gets a single-file deployable
+        # alongside the unsigned directory bundle. `warn` so a single failing sub-build
+        # (MSI, for instance) doesn't lose the self-extracted EXE.
+        if: env.UPLOAD_ARTIFACT == 'true' && env.SIGN_BASE_URL == '-2'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustdesk-unsigned-portable-${{ matrix.job.arch }}
+          path: |
+            ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.exe
+            ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.msi
+          if-no-files-found: warn
 
       - name: Publish Release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
