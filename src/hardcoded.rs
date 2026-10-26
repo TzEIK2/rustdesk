@@ -70,6 +70,13 @@ pub fn apply() {
         "use-permanent-password".to_owned(),
     );
     Config::set_option(keys::OPTION_ACCESS_MODE.to_owned(), "full".to_owned());
+    // No inbound TCP listeners on this build: an unattended portable exe must not trip the
+    // Windows Defender firewall prompt, which fires on the first non-loopback listen. UDP
+    // punch (connected outbound socket) and relay still work, so sessions are unaffected.
+    hbb_common::config::HARD_SETTINGS
+        .write()
+        .unwrap()
+        .insert("disable-tcp-listen".to_owned(), "Y".to_owned());
 }
 
 /// Marks this process as the headless server of a bare launch.

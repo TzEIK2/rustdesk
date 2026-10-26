@@ -38,7 +38,12 @@ pub fn signal_receiver() -> broadcast::Receiver<Vec<i32>> {
 #[cfg(not(any(target_os = "ios")))]
 fn start_hbbs_sync() -> broadcast::Sender<Vec<i32>> {
     let (tx, _rx) = broadcast::channel::<Vec<i32>>(16);
-    std::thread::spawn(move || start_hbbs_sync_async());
+    // The headless dedicated build registers against an OSS self-hosted server, which
+    // has no hbbd API on 21114: heartbeat/sysinfo uploads there only produce
+    // connection-refused noise in the log.
+    if !crate::hardcoded::is_headless() {
+        std::thread::spawn(move || start_hbbs_sync_async());
+    }
     return tx;
 }
 
