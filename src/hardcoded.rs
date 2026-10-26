@@ -39,7 +39,7 @@ pub const RENDEZVOUS_SERVER: &str = "192.168.8.199";
 
 /// Key of the self-hosted hbbs, when it is started with `-k`. Leave empty when the
 /// server runs without a key.
-pub const RENDEZVOUS_KEY: &str = "tpLT4fdbPo2w1ljv8WscZSuEMgFmB67H";
+pub const RENDEZVOUS_KEY: &str = "YTiykQE+KSgL963pwsgA2ByoHUMExjSUm45pLqG+EY4=";
 
 static HEADLESS: AtomicBool = AtomicBool::new(false);
 
