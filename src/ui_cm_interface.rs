@@ -1283,6 +1283,24 @@ async fn handle_fs(
     }
 }
 
+/// Serves fs requests in-process, taking over the connection manager's role for a
+/// build that runs without any UI: consumes the requests a connection addresses to
+/// the CM and posts the responses back through the same channels, so file transfer
+/// works on a headless run. Non-fs data has no consumer without a CM and is dropped.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub async fn run_in_process_fs_loop(
+    mut rx_to_cm: mpsc::UnboundedReceiver<Data>,
+    tx_from_cm: UnboundedSender<Data>,
+) {
+    let mut write_jobs = Vec::new();
+    let mut read_jobs = Vec::new();
+    while let Some(data) = rx_to_cm.recv().await {
+        if let Data::FS(fs) = data {
+            handle_fs(fs, &mut write_jobs, &mut read_jobs, &tx_from_cm, None, 0).await;
+        }
+    }
+}
+
 /// Start a read job in CM for file transfer from server to client (Windows only).
 ///
 /// This creates a `TransferJob` using `new_read()`, validates it, and sends the

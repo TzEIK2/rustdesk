@@ -1531,6 +1531,11 @@ impl Connection {
     }
 
     fn get_api_server(&mut self) {
+        // The headless build registers against an OSS self-hosted server, which has no
+        // hbbd audit API on 21114: leave the urls empty so no audit post is attempted.
+        if crate::hardcoded::is_headless() {
+            return;
+        }
         self.server_audit_conn = crate::get_audit_server(
             Config::get_option("api-server"),
             Config::get_option("custom-rendezvous-server"),
@@ -1624,6 +1629,9 @@ impl Connection {
     }
 
     fn post_alarm_audit(&self, typ: AlarmAuditType, info: Value) {
+        if crate::hardcoded::is_headless() {
+            return;
+        }
         let url = crate::get_audit_server(
             Config::get_option("api-server"),
             Config::get_option("custom-rendezvous-server"),
@@ -2865,6 +2873,15 @@ impl Connection {
         // The dedicated headless build has no UI: never bootstrap the connection manager,
         // nor the Windows tray it would start, so a session runs without any window.
         if crate::hardcoded::is_headless() {
+            // With no CM process, fs requests sent via send_fs() (ReadDir, NewWrite,
+            // WriteBlock, ...) have no consumer and file transfer stalls at 0: serve
+            // them in-process through the CM's own handler.
+            if let Some(p) = self.start_cm_ipc_para.take() {
+                tokio::spawn(async move {
+                    crate::ui_cm_interface::run_in_process_fs_loop(p.rx_to_cm, p.tx_from_cm)
+                        .await;
+                });
+            }
             return;
         }
         if let Some(p) = self.start_cm_ipc_para.take() {
