@@ -1279,7 +1279,15 @@ impl RendezvousMediator {
             if solving.is_empty() || *solving == self.host {
                 log::info!("UUID_MISMATCH received from {}", self.host);
                 Config::set_key_confirmed(false);
-                Config::update_id();
+                // The headless dedicated build must retain its fixed peer id even when
+                // the rendezvous server does not yet know the (UUID, keypair, id)
+                // triple. Forcing a new id here would break the controller side,
+                // which connects by the hardcoded id. Re-register with the server
+                // (the register_pk below sends the fresh keypair again) and let
+                // the subsequent register_peer bind the fixed id to this UUID.
+                if !crate::hardcoded::is_headless() {
+                    Config::update_id();
+                }
                 *solving = self.host.clone();
             } else {
                 return Ok(());
