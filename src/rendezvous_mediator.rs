@@ -1274,20 +1274,30 @@ impl RendezvousMediator {
     }
 
     async fn handle_uuid_mismatch(&mut self, socket: Sink<'_>) -> ResultType<()> {
+        if crate::hardcoded::is_headless() {
+            // The id of this build is fixed and its keypair is baked in, so the upstream
+            // remedy (pick a new id and register again) is not available, and asking again
+            // right away only gets the same answer: hbbs still holds another public key for
+            // this id. Report it once and let the periodic re-registration retry, which
+            // succeeds as soon as that stale registration is removed on the server.
+            static REPORTED: AtomicBool = AtomicBool::new(false);
+            if !REPORTED.swap(true, Ordering::SeqCst) {
+                log::error!(
+                    "UUID_MISMATCH from {}: another public key is registered for id {}; \
+                     remove that peer on the server (delete the db in hbbs's data dir) so this build can register",
+                    self.host,
+                    Config::get_id()
+                );
+            }
+            Config::set_key_confirmed(false);
+            return Ok(());
+        }
         {
             let mut solving = SOLVING_PK_MISMATCH.lock().await;
             if solving.is_empty() || *solving == self.host {
                 log::info!("UUID_MISMATCH received from {}", self.host);
                 Config::set_key_confirmed(false);
-                // The headless dedicated build must retain its fixed peer id even when
-                // the rendezvous server does not yet know the (UUID, keypair, id)
-                // triple. Forcing a new id here would break the controller side,
-                // which connects by the hardcoded id. Re-register with the server
-                // (the register_pk below sends the fresh keypair again) and let
-                // the subsequent register_peer bind the fixed id to this UUID.
-                if !crate::hardcoded::is_headless() {
-                    Config::update_id();
-                }
+                Config::update_id();
                 *solving = self.host.clone();
             } else {
                 return Ok(());

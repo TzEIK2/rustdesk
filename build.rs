@@ -1,3 +1,146 @@
+/// File that carries one build's identity to every later cargo invocation of the same
+/// working tree, so all artifacts of one CI job share the id, password and seed.
+const PEER_IDENTITY_FILE: &str = ".peer_identity";
+
+/// Identity baked into the built client: the id the controlled peer registers with, the
+/// password it accepts and the seed its Ed25519 keypair is derived from.
+#[derive(Default, PartialEq)]
+struct PeerIdentity {
+    id: String,
+    password: String,
+    seed: String,
+}
+
+/// Bakes a random id and password into the build.
+///
+/// The values come from `RD_PEER_ID` / `RD_PEER_PASSWORD` / `RD_PEER_SEED` when set, else
+/// from [`PEER_IDENTITY_FILE`], else are generated here. They are exported to the crate as
+/// compile-time environment variables and only visible through `-show`: printing them in
+/// the build log would leak the password into CI output.
+fn gen_peer_identity() {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+    let path = std::path::Path::new(&manifest_dir).join(PEER_IDENTITY_FILE);
+    let stored = read_peer_identity(&path);
+    let mut identity = PeerIdentity {
+        id: std::env::var("RD_PEER_ID").unwrap_or_else(|_| stored.id.clone()),
+        password: std::env::var("RD_PEER_PASSWORD").unwrap_or_else(|_| stored.password.clone()),
+        seed: std::env::var("RD_PEER_SEED").unwrap_or_else(|_| stored.seed.clone()),
+    };
+    if !is_valid_peer_id(&identity.id) {
+        identity.id = random_peer_id();
+    }
+    if identity.password.is_empty() {
+        identity.password = random_password(12);
+    }
+    if !is_valid_seed(&identity.seed) {
+        identity.seed = hex(&random_bytes(32));
+    }
+    if identity != stored {
+        write_peer_identity(&path, &identity);
+    }
+    println!("cargo:rustc-env=RD_PEER_ID={}", identity.id);
+    println!("cargo:rustc-env=RD_PEER_PASSWORD={}", identity.password);
+    println!("cargo:rustc-env=RD_PEER_SEED={}", identity.seed);
+    println!("cargo:rerun-if-env-changed=RD_PEER_ID");
+    println!("cargo:rerun-if-env-changed=RD_PEER_PASSWORD");
+    println!("cargo:rerun-if-env-changed=RD_PEER_SEED");
+    println!("cargo:rerun-if-changed={}", path.display());
+}
+
+fn read_peer_identity(path: &std::path::Path) -> PeerIdentity {
+    let mut identity = PeerIdentity::default();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return identity;
+    };
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "id" => identity.id = value.trim().to_owned(),
+            "password" => identity.password = value.trim().to_owned(),
+            "seed" => identity.seed = value.trim().to_owned(),
+            _ => {}
+        }
+    }
+    identity
+}
+
+fn write_peer_identity(path: &std::path::Path, identity: &PeerIdentity) {
+    let text = format!(
+        "# Generated at build time; every cargo invocation of this build reuses it.\nid={}\npassword={}\nseed={}\n",
+        identity.id, identity.password, identity.seed
+    );
+    if let Err(err) = std::fs::write(path, text) {
+        println!("cargo:warning=failed to store {}: {err}", path.display());
+    }
+}
+
+/// hbbs rejects ids shorter than six characters.
+fn is_valid_peer_id(id: &str) -> bool {
+    (6..=16).contains(&id.len()) && id.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// The keypair seed is 32 bytes written as hex.
+fn is_valid_seed(seed: &str) -> bool {
+    seed.len() == 64 && seed.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn random_bytes(len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
+            if file.read_exact(&mut buf).is_ok() {
+                return buf;
+            }
+        }
+    }
+    // Fallback for hosts without /dev/urandom: splitmix64 seeded by the clock and pid.
+    let mut state = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+        ^ ((std::process::id() as u64) << 32);
+    for chunk in buf.chunks_mut(8) {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        chunk.copy_from_slice(&z.to_le_bytes()[..chunk.len()]);
+    }
+    buf
+}
+
+fn random_peer_id() -> String {
+    let bytes = random_bytes(9);
+    let mut id = String::with_capacity(bytes.len());
+    id.push((b'1' + bytes[0] % 9) as char);
+    for b in &bytes[1..] {
+        id.push((b'0' + b % 10) as char);
+    }
+    id
+}
+
+/// Password without characters that are easy to confuse when copied by hand.
+fn random_password(len: usize) -> String {
+    const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    random_bytes(len)
+        .iter()
+        .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
+        .collect()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        text.push_str(&format!("{:02x}", b));
+    }
+    text
+}
+
 #[cfg(windows)]
 fn build_windows() {
     let file = "src/platform/windows.cc";
@@ -86,6 +229,7 @@ fn install_android_deps() {
 }
 
 fn main() {
+    gen_peer_identity();
     hbb_common::gen_version();
     install_android_deps();
     #[cfg(all(windows, feature = "inline"))]

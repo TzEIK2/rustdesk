@@ -229,7 +229,25 @@ fn is_windows_7() -> bool {
     false
 }
 
+#[cfg(windows)]
+fn attach_console() {
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    #[allow(non_snake_case)]
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    // Failing means there is no console to attach to; the payload then falls back to a
+    // message box.
+    let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
 fn execute(path: PathBuf, args: Vec<String>, _ui: bool) {
+    // The payload reports its credentials on stdout for `-show`; that only reaches the
+    // caller's terminal when this wrapper is attached to it first.
+    #[cfg(windows)]
+    if args.iter().any(|arg| arg == "-show" || arg == "--show") {
+        attach_console();
+    }
     println!("executing {}", path.display());
     // setup env
     let exe = std::env::current_exe().unwrap_or_default();

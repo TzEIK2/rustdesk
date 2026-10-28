@@ -593,6 +593,7 @@ extern "C" {
     fn is_win_down() -> BOOL;
     fn is_local_system() -> BOOL;
     fn alloc_console_and_redirect();
+    fn attach_console_and_redirect() -> BOOL;
     fn is_service_running_w(svc_name: *const u16) -> bool;
 }
 
@@ -4073,6 +4074,12 @@ pub fn alloc_console() {
     unsafe {
         alloc_console_and_redirect();
     }
+}
+
+/// Attaches this process to the console of the process that started it, so `-show` output
+/// lands in the caller's terminal. Returns false when there is no console to attach to.
+pub fn attach_console() -> bool {
+    unsafe { attach_console_and_redirect() != 0 }
 }
 
 fn get_license() -> Option<CustomServer> {

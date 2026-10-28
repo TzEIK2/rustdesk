@@ -224,9 +224,6 @@ class _ConnectionPageState extends State<ConnectionPage>
     if (_idController.text.isEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
         var lastRemoteId = await bind.mainGetLastRemoteId();
-        if (lastRemoteId.isEmpty) {
-          lastRemoteId = kHardcodedPeerId;
-        }
         if (lastRemoteId != _idController.id) {
           setState(() {
             _idController.id = lastRemoteId;

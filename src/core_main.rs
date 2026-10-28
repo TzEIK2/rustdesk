@@ -43,10 +43,19 @@ fn finish_macos_update(result: hbb_common::ResultType<()>) -> Option<CoreMainAct
 /// If it returns [`Some`], the action determines whether to start the UI or report failure.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn core_main() -> Option<CoreMainAction> {
+    // `-show` only reports this build's credentials: nothing else is initialized, so no
+    // config is written and no server or UI starts.
+    if std::env::args().nth(1).is_some_and(|arg| arg == "-show" || arg == "--show") {
+        crate::hardcoded::show_credentials();
+        return None;
+    }
     if !crate::common::global_init() {
         return None;
     }
     crate::load_custom_client();
+    // Before anything reads the config: a wiped config (a restored machine snapshot) must
+    // still present this build's own key, or hbbs answers `UUID_MISMATCH` for this id.
+    crate::hardcoded::ensure_fixed_keypair();
     crate::hardcoded::apply();
     #[cfg(windows)]
     if !crate::platform::windows::bootstrap() {
@@ -481,9 +490,6 @@ pub fn core_main() -> Option<CoreMainAction> {
             return None;
         } else if args[0] == "--get-id" {
             println!("{}", crate::ipc::get_id());
-            return None;
-        } else if args[0] == "-show" || args[0] == "--show" {
-            crate::hardcoded::show_credentials();
             return None;
         } else if args[0] == "--set-id" {
             if is_cli_setting_change_disabled() {

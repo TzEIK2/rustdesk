@@ -892,6 +892,15 @@ extern "C"
         freopen("CONOUT$", "w", stdout);
     }
 
+    BOOL attach_console_and_redirect()
+    {
+        if (!AttachConsole(ATTACH_PARENT_PROCESS))
+            return FALSE;
+        freopen("CONOUT$", "w", stdout);
+        freopen("CONOUT$", "w", stderr);
+        return TRUE;
+    }
+
     bool is_service_running_w(LPCWSTR serviceName)
     {
         SC_HANDLE hSCManager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);

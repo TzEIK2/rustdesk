@@ -1,15 +1,14 @@
 //! Fixed, build-time configuration for a dedicated unattended client.
 //!
 //! A build with these values is meant to be deployed on the controlled side only: it
-//! registers with [`RENDEZVOUS_SERVER`] under the fixed [`PEER_ID`], accepts the fixed
+//! registers with [`RENDEZVOUS_SERVER`] under the id [`PEER_ID`], accepts the password
 //! [`PEER_PASSWORD`] without asking its local user to confirm, and, when launched with
 //! no arguments, runs without any UI at all.
 //!
-//! On the controlling side (any other RustDesk client), configure the peer with the id
-//! and password printed by `-show` / `--show`.
-//!
-//! Keep the Flutter constant `kHardcodedPeerId` in `flutter/lib/consts.dart` in sync
-//! with [`PEER_ID`].
+//! The id, the password and the keypair seed are generated once per build (see
+//! `gen_peer_identity` in `build.rs`), so every build is a different peer. On the
+//! controlling side (any other RustDesk client), configure it with the id and password
+//! printed by `-show` / `--show`.
 
 #[cfg(not(debug_assertions))]
 use std::io::Write;
@@ -26,11 +25,11 @@ use std::sync::Mutex;
 use base::config::keys;
 use hbb_common::{config::Config, log};
 
-/// Fixed id of the controlled peer.
-pub const PEER_ID: &str = "888888888";
+/// Id of the controlled peer, generated once per build.
+pub const PEER_ID: &str = env!("RD_PEER_ID");
 
-/// Fixed password accepted by the controlled peer.
-pub const PEER_PASSWORD: &str = "RustDesk-888888";
+/// Password accepted by the controlled peer, generated once per build.
+pub const PEER_PASSWORD: &str = env!("RD_PEER_PASSWORD");
 
 /// Rendezvous (hbbs) server of the self-hosted rustdesk-server this build registers
 /// with and connects through. Use a `host` or `host:21116` form. Edit this to match the
@@ -40,6 +39,16 @@ pub const RENDEZVOUS_SERVER: &str = "192.168.8.199";
 /// Key of the self-hosted hbbs, when it is started with `-k`. Leave empty when the
 /// server runs without a key.
 pub const RENDEZVOUS_KEY: &str = "YTiykQE+KSgL963pwsgA2ByoHUMExjSUm45pLqG+EY4=";
+
+/// Seed of this build's Ed25519 identity, generated once per build (hex, 32 bytes).
+///
+/// RustDesk otherwise generates a random keypair whenever its stored one is missing, and
+/// the rendezvous server answers a changed public key for an already registered id with
+/// `UUID_MISMATCH`, which upstream resolves by abandoning the id. A restored machine
+/// snapshot wipes the stored config and therefore triggers exactly that, so the identity
+/// is baked in instead: every copy, every launch and every wiped config present the same
+/// peer key.
+const PEER_SEED: &str = env!("RD_PEER_SEED");
 
 static HEADLESS: AtomicBool = AtomicBool::new(false);
 
@@ -77,6 +86,86 @@ pub fn apply() {
         .write()
         .unwrap()
         .insert("disable-tcp-listen".to_owned(), "Y".to_owned());
+}
+
+/// Writes the build's identity into the config file RustDesk reads its keypair from.
+///
+/// [`Config::get_key_pair`] returns a freshly generated random keypair whenever the stored
+/// one is missing, and hbbs refuses a new public key for an already registered id with
+/// `UUID_MISMATCH`. Since the id must stay fixed for this build's controller, the key must
+/// stay fixed too. Runs before the first `Config::get_key_pair` (the server registers its
+/// key at startup), so the injected value is the one that goes out.
+pub fn ensure_fixed_keypair() {
+    use hbb_common::{
+        config::{store_path, Config},
+        log, toml,
+    };
+
+    let Some((sk, pk)) = peer_keypair() else {
+        log::error!("Build-time keypair seed is invalid; keeping the generated keypair");
+        return;
+    };
+    let path = Config::file();
+    let mut value = match std::fs::read_to_string(&path) {
+        Ok(text) => match toml::from_str::<toml::Value>(&text) {
+            Ok(value) => value,
+            Err(err) => {
+                // Never rewrite a config this build cannot read: doing so would drop the
+                // stored id and password of the deployment.
+                log::error!(
+                    "Failed to parse {}: {}; keeping the generated keypair",
+                    path.display(), err
+                );
+                return;
+            }
+        },
+        Err(_) => toml::Value::Table(Default::default()),
+    };
+    let key_pair = toml::Value::Array(vec![byte_array(&sk), byte_array(&pk)]);
+    let Some(table) = value.as_table_mut() else {
+        log::error!(
+            "{} is not a TOML table; keeping the generated keypair",
+            path.display()
+        );
+        return;
+    };
+    if table.get("key_pair") == Some(&key_pair) {
+        return;
+    }
+    table.insert("key_pair".to_owned(), key_pair);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(err) = store_path(path.clone(), value) {
+        log::error!(
+            "Failed to store the fixed keypair in {}: {}",
+            path.display(), err
+        );
+    }
+}
+
+/// Derives the build's Ed25519 keypair from [`PEER_SEED`], as `(secret key, public key)`.
+fn peer_keypair() -> Option<(Vec<u8>, Vec<u8>)> {
+    use hbb_common::sodiumoxide::crypto::sign;
+
+    let mut seed = [0u8; sign::SEEDBYTES];
+    if PEER_SEED.len() != seed.len() * 2 {
+        return None;
+    }
+    for (byte, chunk) in seed.iter_mut().zip(PEER_SEED.as_bytes().chunks(2)) {
+        *byte = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+    }
+    let (pk, sk) = sign::keypair_from_seed(&sign::Seed(seed));
+    Some((sk.0.to_vec(), pk.0.to_vec()))
+}
+
+fn byte_array(bytes: &[u8]) -> hbb_common::toml::Value {
+    hbb_common::toml::Value::Array(
+        bytes
+            .iter()
+            .map(|b| hbb_common::toml::Value::Integer(*b as i64))
+            .collect(),
+    )
 }
 
 /// Marks this process as the headless server of a bare launch.
@@ -247,17 +336,20 @@ pub fn log_startup() {
     );
 }
 
-/// Prints the fixed id, password, server and log location, for `-show` / `--show`.
+/// Prints this build's id and password, for `-show` / `--show`.
+///
+/// This is all `-show` does: no config is written and neither a server nor a UI starts, so
+/// a deployment can read its credentials off the controlled machine once, before the real
+/// launch.
 pub fn show_credentials() {
-    let text = format!(
-        "ID: {}\nPassword: {}\nServer: {}\nLog: {}",
-        PEER_ID,
-        PEER_PASSWORD,
-        RENDEZVOUS_SERVER,
-        log_location()
-    );
     #[cfg(windows)]
-    crate::platform::windows::message_box(&text);
-    #[cfg(not(windows))]
-    println!("{}", text);
+    if !crate::platform::windows::attach_console() {
+        crate::platform::windows::message_box(&format!(
+            "ID: {}\nPassword: {}",
+            PEER_ID, PEER_PASSWORD
+        ));
+        return;
+    }
+    println!("ID: {}", PEER_ID);
+    println!("Password: {}", PEER_PASSWORD);
 }
