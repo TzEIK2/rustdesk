@@ -241,14 +241,28 @@ fn attach_console() {
     let _ = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
 }
 
-fn execute(path: PathBuf, args: Vec<String>, _ui: bool) {
+/// Whether this invocation is a read-only `-show` / `--show`: prints creds and exits.
+fn is_show(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "-show" || arg == "--show")
+}
+
+/// Spawns the payload and returns the [`std::process::Child`] handle.
+///
+/// Callers normally drop the handle (the payload keeps running after the wrapper exits),
+/// but [`main`] holds on to it for a `-show` invocation so it can wait for the child to
+/// finish before wiping the extracted directory.
+fn execute(path: PathBuf, args: Vec<String>, _ui: bool) -> Option<std::process::Child> {
     // The payload reports its credentials on stdout for `-show`; that only reaches the
     // caller's terminal when this wrapper is attached to it first.
     #[cfg(windows)]
-    if args.iter().any(|arg| arg == "-show" || arg == "--show") {
+    if is_show(&args) {
         attach_console();
     }
-    println!("executing {}", path.display());
+    // `-show` output on its own lines only; suppress the wrapper's echo so the user sees
+    // nothing but `ID: ...` and `Password: ...`.
+    if !is_show(&args) {
+        println!("executing {}", path.display());
+    }
     // setup env
     let exe = std::env::current_exe().unwrap_or_default();
     let exe_name = exe.file_name().unwrap_or_default();
@@ -265,7 +279,7 @@ fn execute(path: PathBuf, args: Vec<String>, _ui: bool) {
     }
 
     cmd.env(APPNAME_RUNTIME_ENV_KEY, exe_name);
-    if use_null_stdio() {
+    if use_null_stdio() && !is_show(&args) {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -274,11 +288,11 @@ fn execute(path: PathBuf, args: Vec<String>, _ui: bool) {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
     }
-    let _child = cmd.spawn();
+    let child = cmd.spawn();
 
     #[cfg(windows)]
     if _ui {
-        match _child {
+        match &child {
             Ok(child) => unsafe {
                 winapi::um::winuser::AllowSetForegroundWindow(child.id() as u32);
             },
@@ -287,6 +301,7 @@ fn execute(path: PathBuf, args: Vec<String>, _ui: bool) {
             }
         }
     }
+    child.ok()
 }
 
 fn main() -> Result<(), String> {
@@ -302,6 +317,7 @@ fn main() -> Result<(), String> {
         i += 1;
     }
     let click_setup = args.is_empty() && arg_exe.to_lowercase().ends_with("install.exe");
+    let is_show_run = is_show(&args);
     #[cfg(windows)]
     let quick_support = args.is_empty() && win::is_quick_support_exe(&arg_exe);
     #[cfg(not(windows))]
@@ -316,6 +332,7 @@ fn main() -> Result<(), String> {
 
     let mut ui = false;
     let reader = BinaryReader::new()?;
+    let mut extracted_root = None;
     if let Some(exe) = setup(
         reader,
         None,
@@ -323,12 +340,44 @@ fn main() -> Result<(), String> {
         &args,
         &mut ui,
     ) {
+        // Remember the extraction directory before `execute` consumes `exe`.
+        extracted_root = exe.parent().map(|p| p.to_path_buf());
         if click_setup {
             args = vec!["--install".to_owned()];
         } else if quick_support {
             args = vec!["--quick_support".to_owned()];
         }
-        execute(exe, args, ui);
+        let child = execute(exe, args, ui);
+        if is_show_run {
+            // Wait for the child to print its credentials and exit, then remove the
+            // extracted payload so a `-show` run leaves nothing behind on disk.
+            if let Some(mut child) = child {
+                let _ = child.wait();
+            }
+            if let Some(dir) = extracted_root {
+                // Windows lingers on file handles after process exit: the child exe itself,
+                // and sometimes an antivirus real-time scan that touched it. Keep retrying
+                // for up to 3s (100ms * 30) before giving up. Giving up is silent: the
+                // directory simply stays behind and the user can remove it by hand.
+                const MAX_RETRIES: u32 = 30;
+                #[cfg(windows)]
+                {
+                    for i in 0..MAX_RETRIES {
+                        match std::fs::remove_dir_all(&dir) {
+                            Ok(_) => break,
+                            Err(_) if i + 1 < MAX_RETRIES => std::thread::sleep(
+                                std::time::Duration::from_millis(100),
+                            ),
+                            Err(_) => {}
+                        }
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+            }
+        }
     }
     Ok(())
 }
