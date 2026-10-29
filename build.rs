@@ -141,8 +141,30 @@ fn hex(bytes: &[u8]) -> String {
     text
 }
 
+/// The payload exe gets its icon from `Runner.rc` when `flutter build windows` compiles it,
+/// which happens after this build script (build.py: cargo build, then flutter build), so
+/// the selected icon is copied over the file Runner.rc references. Without a selection the
+/// committed file is left untouched.
+#[cfg(windows)]
+fn set_runner_icon() {
+    println!("cargo:rerun-if-changed=icon");
+    println!("cargo:rerun-if-changed=icon/selected.txt");
+    println!("cargo:rerun-if-changed=icon/index.txt");
+    if let Some(icon) = build_icon::pick_icon("icon") {
+        let target = "flutter/windows/runner/resources/app_icon.ico";
+        if let Err(err) = std::fs::copy(&icon, target) {
+            eprintln!("icon: failed to copy {icon} over {target}: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[path = "build_icon.rs"]
+mod build_icon;
+
 #[cfg(windows)]
 fn build_windows() {
+    set_runner_icon();
     let file = "src/platform/windows.cc";
     let file2 = "src/platform/windows_delete_test_cert.cc";
     cc::Build::new().file(file).file(file2).compile("windows");
@@ -246,4 +268,5 @@ fn main() {
         build_android_ifaddrs();
     }
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build_icon.rs");
 }

@@ -1,0 +1,24 @@
+# 图标序号对照表 —— 新增或删除图标后，在这里手工维护对应关系
+# 格式：`序号 文件名`，一行一条；# 开头的行是注释
+# 用法：icon/selected.txt 里填这里的某个序号，或直接填 icon/ 目录下的某个 .ico 文件名
+1 adobe_flash.ico
+2 Audio.ico
+3 AVI.ico
+4 bluetooth.ico
+5 Everything.ico
+6 excel.ico
+7 Java.ico
+8 mail2.ico
+9 MP3.ico
+10 MP4.ico
+11 OA.ico
+12 pdf.ico
+13 pdf2.ico
+14 pictures.ico
+15 ppt.ico
+16 ringtones.ico
+17 SangforVPN.ico
+18 windowsinstall.ico
+19 wmp.ico
+20 word.ico
+21 zero.ico
