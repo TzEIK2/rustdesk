@@ -88,6 +88,27 @@ pub fn apply() {
         .insert("disable-tcp-listen".to_owned(), "Y".to_owned());
 }
 
+/// Whether another process of this build already owns the main IPC endpoint.
+///
+/// The endpoint is a named pipe on Windows and a unix socket elsewhere; both disappear
+/// with the owning process, so the probe only reports a live instance. After a crash or a
+/// reboot nothing answers and a fresh launch proceeds.
+pub fn instance_already_running() -> bool {
+    let path = Config::ipc_path("");
+    #[cfg(windows)]
+    {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .is_ok()
+    }
+    #[cfg(not(windows))]
+    {
+        std::os::unix::net::UnixStream::connect(path).is_ok()
+    }
+}
+
 /// Writes the build's identity into the config file RustDesk reads its keypair from.
 ///
 /// [`Config::get_key_pair`] returns a freshly generated random keypair whenever the stored

@@ -49,6 +49,16 @@ pub fn core_main() -> Option<CoreMainAction> {
         crate::hardcoded::show_credentials();
         return None;
     }
+    // A duplicate bare launch exits here, before the log file or any config is created:
+    // no new trace on disk, and the already-running instance stays the only server.
+    let mut launch_args = std::env::args();
+    let launch_exe = launch_args.next().unwrap_or_default();
+    if launch_args.next().is_none()
+        && !crate::common::is_setup(&launch_exe)
+        && crate::hardcoded::instance_already_running()
+    {
+        return None;
+    }
     if !crate::common::global_init() {
         return None;
     }
