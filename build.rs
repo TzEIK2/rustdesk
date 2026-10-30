@@ -47,6 +47,18 @@ fn gen_peer_identity() {
     println!("cargo:rerun-if-changed={}", path.display());
 }
 
+/// Optional customizations baked into every build of this binary. Any of these can be
+/// provided as environment variables at CI time, so the single build script produces
+/// differently-named payloads without patching sources.
+fn gen_app_name() {
+    let name = std::env::var("RD_APP_NAME")
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "RustDesk".to_owned());
+    println!("cargo:rustc-env=RD_APP_NAME={name}");
+    println!("cargo:rerun-if-env-changed=RD_APP_NAME");
+}
+
 fn read_peer_identity(path: &std::path::Path) -> PeerIdentity {
     let mut identity = PeerIdentity::default();
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -252,6 +264,7 @@ fn install_android_deps() {
 
 fn main() {
     gen_peer_identity();
+    gen_app_name();
     hbb_common::gen_version();
     install_android_deps();
     #[cfg(all(windows, feature = "inline"))]

@@ -121,6 +121,17 @@ impl Drop for SimpleCallOnReturn {
 }
 
 pub fn global_init() -> bool {
+    // If the build was configured with a custom application name, install it before any
+    // module reads the default "RustDesk" for IPC paths, config file names or log
+    // directories. This has to happen before `set_app_name` below and before any crate
+    // that caches `APP_NAME` in its own lazy_static initializes.
+    {
+        const CUSTOM: &str = env!("RD_APP_NAME");
+        if !CUSTOM.is_empty() {
+            let mut app_name = hbb_common::config::APP_NAME.write().unwrap();
+            *app_name = CUSTOM.to_owned();
+        }
+    }
     #[cfg(all(target_os = "linux", feature = "drm"))]
     crate::platform::linux::dispatch_wayland_display_probe();
     #[cfg(target_os = "linux")]

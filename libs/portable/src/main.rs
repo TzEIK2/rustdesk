@@ -18,7 +18,13 @@ const APP_METADATA: &[u8] = &[];
 const APP_METADATA_CONFIG: &str = "meta.toml";
 const META_LINE_PREFIX_TIMESTAMP: &str = "timestamp = ";
 const META_LINE_PREFIX_FILE: &str = "file = ";
-const APP_PREFIX: &str = "rustdesk";
+// Payload exe basename (without .exe): build.py renames flutter_build_dir_2/rustdesk.exe
+// to this stem + ".exe" before feeding it to generate.py, so the portable extractor
+// unwraps a matching name and `taskkill /IM` on `-force` also matches.
+const PAYLOAD_EXE_STEM: &str = env!("RD_APP_NAME");
+// Directory prefix on disk follows the custom app name baked in by the root build script,
+// so each build lives in its own folder and does not clobber a previous one.
+const APP_PREFIX: &str = env!("RD_APP_NAME");
 #[cfg(windows)]
 const VERIFIED_UPDATE_FILE_PREFIX: &str = "rustdesk-verified-";
 const APPNAME_RUNTIME_ENV_KEY: &str = "RUSTDESK_APPNAME";
@@ -246,6 +252,47 @@ fn is_show(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "-show" || arg == "--show")
 }
 
+/// Kills any running rustdesk.exe payload before we overwrite the extraction directory.
+/// Windows keeps an exclusive handle on an exe while it runs, so without this step
+/// `setup()` would fail with ERROR 5 when writing the new payload.
+///
+/// On Windows we shell out to `taskkill /F /IM rustdesk.exe /T` — this is the simplest way
+/// to terminate every instance of the payload regardless of who launched it (service,
+/// scheduler, double-click). The wait loop polls until the process list is empty so
+/// `setup()` can proceed immediately after.
+///
+/// On non-Windows the OS does not lock the binary while it runs, so overwrite works
+/// without killing.
+fn kill_running_payloads() {
+    #[cfg(windows)]
+    {
+        // The payload's exe name is locked in by Cargo (see PAYLOAD_EXE_STEM above), so
+        // this has to match that stem rather than the custom APP_PREFIX — taskkill /IM
+        // matches the filename in the process list, which is Cargo's bin output name.
+        let payload_name = format!("{}.exe", PAYLOAD_EXE_STEM);
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/IM", &payload_name, "/T"])
+            .output();
+        for _ in 0..50 {
+            let alive = std::process::Command::new("tasklist")
+                .args(["/FI", &format!("IMAGENAME eq {payload_name}")])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            if !alive.contains(&payload_name) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // On Linux/macOS the kernel removes the old binary's inode from the running
+        // process on exec, so writing a new file of the same name succeeds. No kill needed.
+    }
+}
+
 /// Spawns the payload and returns the [`std::process::Child`] handle.
 ///
 /// Callers normally drop the handle (the payload keeps running after the wrapper exits),
@@ -319,6 +366,7 @@ fn main() -> Result<(), String> {
     }
     let click_setup = args.is_empty() && arg_exe.to_lowercase().ends_with("install.exe");
     let is_show_run = is_show(&args);
+    let force_run = args.iter().any(|arg| arg == "-force" || arg == "--force");
     #[cfg(windows)]
     let quick_support = args.is_empty() && win::is_quick_support_exe(&arg_exe);
     #[cfg(not(windows))]
@@ -329,6 +377,15 @@ fn main() -> Result<(), String> {
         if let Err(err) = win::schedule_verified_update_cleanup() {
             eprintln!("Failed to schedule verified update file cleanup: {}", err);
         }
+    }
+
+    // `-force` means "replace any running instance with a fresh payload". The running
+    // instance keeps an exclusive handle on its rustdesk.exe, so we have to kill it
+    // *before* setup() writes the new payload — otherwise the overwrite would fail with
+    // ERROR 5 Access Denied. Windows has no syscall to release a file handle from
+    // another process; taskkill /F is the only reliable way.
+    if force_run {
+        kill_running_payloads();
     }
 
     let mut ui = false;

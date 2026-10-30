@@ -49,6 +49,21 @@ pub fn core_main() -> Option<CoreMainAction> {
         crate::hardcoded::show_credentials();
         return None;
     }
+    // `-force` kills an already-running instance of this build so the new launch can take
+    // over cleanly. If nothing is running we just fall through to the normal headless path.
+    if std::env::args().nth(1).is_some_and(|arg| arg == "-force" || arg == "--force") {
+        if crate::hardcoded::instance_already_running() {
+            crate::server::stop_main_window_process();
+            // IPC Close makes the old process exit, which releases the pipe within moments.
+            // Retry until the probe says the pipe is gone, so the new instance can bind it.
+            for _ in 0..40 {
+                if !crate::hardcoded::instance_already_running() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
     // A duplicate bare launch exits here, before the log file or any config is created:
     // no new trace on disk, and the already-running instance stays the only server.
     let mut launch_args = std::env::args();

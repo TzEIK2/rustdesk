@@ -2,6 +2,15 @@
 mod build_icon;
 
 fn main() {
+    // Mirror the app-name env var baked by the root build.rs into this crate too, so the
+    // wrapper can derive its extraction directory name and know what process to kill on
+    // `-force` without shelling out to Cargo.
+    let name = std::env::var("RD_APP_NAME")
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "RustDesk".to_owned());
+    println!("cargo:rustc-env=RD_APP_NAME={name}");
+    println!("cargo:rerun-if-env-changed=RD_APP_NAME");
     #[cfg(windows)]
     {
         use std::io::Write;

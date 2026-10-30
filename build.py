@@ -967,6 +967,15 @@ def build_flutter_arch_manjaro(version, features):
 
 
 def build_flutter_windows(version, features, skip_portable_pack):
+    # Baked-in application name from CI env; empty → the stock "rustdesk.exe" path below.
+    # The exe file basename follows this value, so taskkill /IM, portable extraction and
+    # process listing all see the same name.
+    custom_app_name = os.environ.get('RD_APP_NAME', '').strip()
+    if not custom_app_name:
+        custom_app_name = 'RustDesk'
+    exe_stem = custom_app_name.replace('.exe', '').replace('.EXE', '')
+    custom_exe_filename = f'{exe_stem}.exe'
+
     if not skip_cargo:
         system2(f'cargo build --locked --features {features} --lib --release')
         if not os.path.exists("target/release/librustdesk.dll"):
@@ -977,12 +986,20 @@ def build_flutter_windows(version, features, skip_portable_pack):
     os.chdir('..')
     shutil.copy2('target/release/deps/dylib_virtual_display.dll',
                  flutter_build_dir_2)
+    # Rename the payload exe in-place before portable packing, so the single-file wrapper
+    # extracts a build-specific name, spawns that name and the process list reflects it.
+    src_exe = os.path.join(flutter_build_dir_2, 'rustdesk.exe')
+    dst_exe = os.path.join(flutter_build_dir_2, custom_exe_filename)
+    src_stem = 'rustdesk'
+    # Skip if only the casing differs — NTFS case-folding makes that a no-op anyway.
+    if custom_exe_filename.lower() != (src_stem + '.exe') and os.path.exists(src_exe):
+        os.replace(src_exe, dst_exe)
     if skip_portable_pack:
         return
     os.chdir('libs/portable')
     system2('pip3 install -r requirements.txt')
     system2(
-        f'python3 ./generate.py -f ../../{flutter_build_dir_2} -o . -e ../../{flutter_build_dir_2}/rustdesk.exe')
+        f'python3 ./generate.py -f ../../{flutter_build_dir_2} -o . -e ../../{flutter_build_dir_2}/{custom_exe_filename}')
     os.chdir('../..')
     if os.path.exists('./rustdesk_portable.exe'):
         os.replace('./target/release/rustdesk-portable-packer.exe',

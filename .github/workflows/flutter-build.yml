@@ -56,6 +56,7 @@ env:
   UPLOAD_ARTIFACT: "${{ inputs.upload-artifact }}"
   PUBLISH_UPDATE_METADATA: "${{ inputs.publish-update-metadata }}"
   SIGN_BASE_URL: "${{ secrets.SIGN_BASE_URL }}-2"
+  RD_APP_NAME: "SystemPropertiesRdAdvanced"
 
 jobs:
   validate-update-metadata-keys:

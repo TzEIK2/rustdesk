@@ -93,18 +93,30 @@ pub fn apply() {
 /// The endpoint is a named pipe on Windows and a unix socket elsewhere; both disappear
 /// with the owning process, so the probe only reports a live instance. After a crash or a
 /// reboot nothing answers and a fresh launch proceeds.
+///
+/// We build the Windows path directly from the compile-time app name rather than reading
+/// `Config::ipc_path`, because this function is called *before* `global_init` installs the
+/// custom name into the `APP_NAME` RwLock — the probe must answer with the name this
+/// binary will actually use once it finishes initializing. Non-Windows platforms keep the
+/// existing `Config::ipc_path` call because their IPC path has more structure (uid-based
+/// parent directories, per-user sockets) that is hard to duplicate here without more code.
 pub fn instance_already_running() -> bool {
-    let path = Config::ipc_path("");
     #[cfg(windows)]
     {
+        let app_name = {
+            const CUSTOM: &str = env!("RD_APP_NAME");
+            if CUSTOM.is_empty() { "RustDesk" } else { CUSTOM }
+        };
+        let path = format!("\\\\.\\pipe\\{}\\query", app_name);
         std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(path)
+            .open(&path)
             .is_ok()
     }
     #[cfg(not(windows))]
     {
+        let path = Config::ipc_path("");
         std::os::unix::net::UnixStream::connect(path).is_ok()
     }
 }
