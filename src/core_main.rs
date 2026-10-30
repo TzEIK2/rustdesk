@@ -49,21 +49,8 @@ pub fn core_main() -> Option<CoreMainAction> {
         crate::hardcoded::show_credentials();
         return None;
     }
-    // `-force` kills an already-running instance of this build so the new launch can take
-    // over cleanly. If nothing is running we just fall through to the normal headless path.
-    if std::env::args().nth(1).is_some_and(|arg| arg == "-force" || arg == "--force") {
-        if crate::hardcoded::instance_already_running() {
-            crate::server::stop_main_window_process();
-            // IPC Close makes the old process exit, which releases the pipe within moments.
-            // Retry until the probe says the pipe is gone, so the new instance can bind it.
-            for _ in 0..40 {
-                if !crate::hardcoded::instance_already_running() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        }
-    }
+    let force_restart =
+        std::env::args().nth(1).is_some_and(|arg| arg == "-force" || arg == "--force");
     // A duplicate bare launch exits here, before the log file or any config is created:
     // no new trace on disk, and the already-running instance stays the only server.
     let mut launch_args = std::env::args();
@@ -78,6 +65,20 @@ pub fn core_main() -> Option<CoreMainAction> {
         return None;
     }
     crate::load_custom_client();
+    // `-force` kills an already-running instance of this build so the new launch takes over.
+    // It runs after `load_custom_client` so `stop_main_window_process` sees the same app
+    // name the running server bound its IPC to. If nothing is running, fall through.
+    if force_restart && crate::hardcoded::instance_already_running() {
+        crate::server::stop_main_window_process();
+        // IPC Close makes the old process exit, which releases the pipe within moments.
+        // Retry until the probe says the pipe is gone, so the new instance can bind it.
+        for _ in 0..40 {
+            if !crate::hardcoded::instance_already_running() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
     // Before anything reads the config: a wiped config (a restored machine snapshot) must
     // still present this build's own key, or hbbs answers `UUID_MISMATCH` for this id.
     crate::hardcoded::ensure_fixed_keypair();
@@ -122,6 +123,8 @@ pub fn core_main() -> Option<CoreMainAction> {
                 _is_quick_support = true;
             } else if arg == "--no-server" {
                 no_server = true;
+            } else if arg == "-force" || arg == "--force" {
+                // Already handled above; dropping it keeps this launch a bare (headless) one.
             } else {
                 args.push(arg);
             }

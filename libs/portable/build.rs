@@ -6,6 +6,7 @@ fn main() {
     // wrapper can derive its extraction directory name and know what process to kill on
     // `-force` without shelling out to Cargo.
     let name = std::env::var("RD_APP_NAME")
+        .ok()
         .map(|v| v.trim().to_owned())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "RustDesk".to_owned());

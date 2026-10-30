@@ -421,6 +421,12 @@ jobs:
         if: env.UPLOAD_ARTIFACT == 'true'
         run: |
           sed -i '/dpiAware/d' res/manifest.xml
+          # Pack the payload under the configured app name so the extracted process is not
+          # "rustdesk.exe". Restored afterwards so the MSI step still finds rustdesk.exe.
+          APP_EXE="${RD_APP_NAME:-RustDesk}.exe"
+          if [ "${APP_EXE}" != "rustdesk.exe" ] && [ -f "./rustdesk/rustdesk.exe" ]; then
+            mv "./rustdesk/rustdesk.exe" "./rustdesk/${APP_EXE}"
+          fi
           pushd ./libs/portable
           pip3 install -r requirements.txt
           # Unsigned (headless) builds suppress the first-run loading animation window
@@ -428,8 +434,11 @@ jobs:
           # the default `native-windows-gui` behavior for GUI users.
           FEATURES=""
           if [ "${SIGN_BASE_URL}" = "-2" ]; then FEATURES="no-ui"; fi
-          python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe --features "$FEATURES"
+          python3 ./generate.py -f ../../rustdesk/ -o . -e "../../rustdesk/${APP_EXE}" --features "$FEATURES"
           popd
+          if [ "${APP_EXE}" != "rustdesk.exe" ] && [ -f "./rustdesk/${APP_EXE}" ]; then
+            mv "./rustdesk/${APP_EXE}" "./rustdesk/rustdesk.exe"
+          fi
           mkdir -p ./SignOutput
           mv ./target/release/rustdesk-portable-packer.exe ./SignOutput/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.exe
 

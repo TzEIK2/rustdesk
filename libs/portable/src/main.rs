@@ -18,12 +18,9 @@ const APP_METADATA: &[u8] = &[];
 const APP_METADATA_CONFIG: &str = "meta.toml";
 const META_LINE_PREFIX_TIMESTAMP: &str = "timestamp = ";
 const META_LINE_PREFIX_FILE: &str = "file = ";
-// Payload exe basename (without .exe): build.py renames flutter_build_dir_2/rustdesk.exe
-// to this stem + ".exe" before feeding it to generate.py, so the portable extractor
-// unwraps a matching name and `taskkill /IM` on `-force` also matches.
-const PAYLOAD_EXE_STEM: &str = env!("RD_APP_NAME");
 // Directory prefix on disk follows the custom app name baked in by the root build script,
-// so each build lives in its own folder and does not clobber a previous one.
+// so each build lives in its own folder and does not clobber a previous one. The CI packs
+// the payload as `<this>.exe`, so `taskkill /IM` on `-force` targets the same name.
 const APP_PREFIX: &str = env!("RD_APP_NAME");
 #[cfg(windows)]
 const VERIFIED_UPDATE_FILE_PREFIX: &str = "rustdesk-verified-";
@@ -266,10 +263,9 @@ fn is_show(args: &[String]) -> bool {
 fn kill_running_payloads() {
     #[cfg(windows)]
     {
-        // The payload's exe name is locked in by Cargo (see PAYLOAD_EXE_STEM above), so
-        // this has to match that stem rather than the custom APP_PREFIX — taskkill /IM
-        // matches the filename in the process list, which is Cargo's bin output name.
-        let payload_name = format!("{}.exe", PAYLOAD_EXE_STEM);
+        // The payload is packed under the same stem the wrapper extracts and spawns,
+        // so `taskkill /IM` matches exactly this build's process.
+        let payload_name = format!("{}.exe", APP_PREFIX);
         let _ = std::process::Command::new("taskkill")
             .args(["/F", "/IM", &payload_name, "/T"])
             .output();
