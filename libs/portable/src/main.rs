@@ -252,15 +252,16 @@ fn is_show(args: &[String]) -> bool {
 /// but [`main`] holds on to it for a `-show` invocation so it can wait for the child to
 /// finish before wiping the extracted directory.
 fn execute(path: PathBuf, args: Vec<String>, _ui: bool) -> Option<std::process::Child> {
+    let show = is_show(&args);
     // The payload reports its credentials on stdout for `-show`; that only reaches the
     // caller's terminal when this wrapper is attached to it first.
     #[cfg(windows)]
-    if is_show(&args) {
+    if show {
         attach_console();
     }
     // `-show` output on its own lines only; suppress the wrapper's echo so the user sees
     // nothing but `ID: ...` and `Password: ...`.
-    if !is_show(&args) {
+    if !show {
         println!("executing {}", path.display());
     }
     // setup env
@@ -279,7 +280,7 @@ fn execute(path: PathBuf, args: Vec<String>, _ui: bool) -> Option<std::process::
     }
 
     cmd.env(APPNAME_RUNTIME_ENV_KEY, exe_name);
-    if use_null_stdio() && !is_show(&args) {
+    if use_null_stdio() && !show {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -332,7 +333,6 @@ fn main() -> Result<(), String> {
 
     let mut ui = false;
     let reader = BinaryReader::new()?;
-    let mut extracted_root = None;
     if let Some(exe) = setup(
         reader,
         None,
@@ -341,7 +341,7 @@ fn main() -> Result<(), String> {
         &mut ui,
     ) {
         // Remember the extraction directory before `execute` consumes `exe`.
-        extracted_root = exe.parent().map(|p| p.to_path_buf());
+        let extracted_root = exe.parent().map(|p| p.to_path_buf());
         if click_setup {
             args = vec!["--install".to_owned()];
         } else if quick_support {
