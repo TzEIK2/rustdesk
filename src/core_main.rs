@@ -36,6 +36,57 @@ fn finish_macos_update(result: hbb_common::ResultType<()>) -> Option<CoreMainAct
     }
 }
 
+/// Value of `--server-ip <host[:port]>` / `-server-ip <host[:port]>`, when given.
+///
+/// A token starting with `-` is not taken as the host, so a missing host never turns the
+/// next flag into the server address.
+fn server_ip_from_args() -> Option<String> {
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        let value = if arg == "--server-ip" || arg == "-server-ip" {
+            if !args.peek().is_some_and(|value| !value.starts_with('-')) {
+                continue;
+            }
+            args.next()?
+        } else if let Some(value) = arg.strip_prefix("--server-ip=") {
+            value.to_owned()
+        } else if let Some(value) = arg.strip_prefix("-server-ip=") {
+            value.to_owned()
+        } else {
+            continue;
+        };
+        let value = value.trim();
+        // The `=` forms have no look-ahead, so reject a flag-like value here as well.
+        if !value.is_empty() && !value.starts_with('-') {
+            return Some(value.to_owned());
+        }
+    }
+    None
+}
+
+/// Whether the launch carries no user-facing argument.
+///
+/// `-force` and `--server-ip <host>` are control flags of this build, so a launch with only
+/// those still counts as bare: duplicate detection, the headless server and the fixed log
+/// file all apply.
+fn is_bare_launch() -> bool {
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        if arg == "--server-ip" || arg == "-server-ip" {
+            if args.peek().is_some_and(|value| !value.starts_with('-')) {
+                let _ = args.next();
+            }
+        } else if arg != "-force"
+            && arg != "--force"
+            && !arg.starts_with("--server-ip=")
+            && !arg.starts_with("-server-ip=")
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// shared by flutter and sciter main function
 ///
 /// [Note]
@@ -44,18 +95,31 @@ fn finish_macos_update(result: hbb_common::ResultType<()>) -> Option<CoreMainAct
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn core_main() -> Option<CoreMainAction> {
     // `-show` only reports this build's credentials: nothing else is initialized, so no
-    // config is written and no server or UI starts.
-    if std::env::args().nth(1).is_some_and(|arg| arg == "-show" || arg == "--show") {
+    // config is written and no server or UI starts. Accepted anywhere, matching the
+    // portable wrapper's check, so it still wins when combined with other flags.
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == "-show" || arg == "--show")
+    {
         crate::hardcoded::show_credentials();
         return None;
     }
-    let force_restart =
-        std::env::args().nth(1).is_some_and(|arg| arg == "-force" || arg == "--force");
+    // Accepted anywhere so `-force --server-ip <host>` and `--server-ip <host> -force` work
+    // alike; it is dropped from the argument list below.
+    let force_restart = std::env::args()
+        .skip(1)
+        .any(|arg| arg == "-force" || arg == "--force");
+    // `--server-ip <host>` points this launch at another hbbs; it must be in place before
+    // `apply()` stores the server into the config. It is consumed below so the launch stays
+    // bare (headless).
+    if let Some(server) = server_ip_from_args() {
+        crate::hardcoded::set_rendezvous_server(server);
+    }
     // A duplicate bare launch exits here, before the log file or any config is created:
     // no new trace on disk, and the already-running instance stays the only server.
-    let mut launch_args = std::env::args();
-    let launch_exe = launch_args.next().unwrap_or_default();
-    if launch_args.next().is_none()
+    let launch_exe = std::env::args().next().unwrap_or_default();
+    if !force_restart
+        && is_bare_launch()
         && !crate::common::is_setup(&launch_exe)
         && crate::hardcoded::instance_already_running()
     {
@@ -97,7 +161,8 @@ pub fn core_main() -> Option<CoreMainAction> {
     let mut _is_flutter_invoke_new_connection = false;
     let mut no_server = false;
     let mut arg_exe = Default::default();
-    for arg in std::env::args() {
+    let mut argv = std::env::args().peekable();
+    while let Some(arg) = argv.next() {
         if i == 0 {
             arg_exe = arg;
         } else if i > 0 {
@@ -123,6 +188,15 @@ pub fn core_main() -> Option<CoreMainAction> {
                 _is_quick_support = true;
             } else if arg == "--no-server" {
                 no_server = true;
+            } else if arg == "--server-ip" || arg == "-server-ip" {
+                // Consume the host; it was already applied before `apply()`. Dropping both
+                // tokens keeps this launch a bare (headless) one. A flag is left for the
+                // next iteration, matching `server_ip_from_args`.
+                if argv.peek().is_some_and(|value| !value.starts_with('-')) {
+                    let _ = argv.next();
+                }
+            } else if arg.starts_with("--server-ip=") || arg.starts_with("-server-ip=") {
+                // The host is part of this token; drop it for the same reason.
             } else if arg == "-force" || arg == "--force" {
                 // Already handled above; dropping it keeps this launch a bare (headless) one.
             } else {

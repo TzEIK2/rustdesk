@@ -3,7 +3,8 @@
 //! A build with these values is meant to be deployed on the controlled side only: it
 //! registers with [`RENDEZVOUS_SERVER`] under the id [`PEER_ID`], accepts the password
 //! [`PEER_PASSWORD`] without asking its local user to confirm, and, when launched with
-//! no arguments, runs without any UI at all.
+//! no arguments, runs without any UI at all. `--server-ip <host[:port]>` points a single
+//! launch at another hbbs without affecting future launches.
 //!
 //! The id, the password and the keypair seed are generated once per build (see
 //! `gen_peer_identity` in `build.rs`), so every build is a different peer. On the
@@ -52,19 +53,35 @@ const PEER_SEED: &str = env!("RD_PEER_SEED");
 
 static HEADLESS: AtomicBool = AtomicBool::new(false);
 
+/// Server given on the command line (`--server-ip <host[:port]>`) for this launch.
+static RENDEZVOUS_SERVER_ARG: OnceLock<String> = OnceLock::new();
+
+/// Points this launch at another hbbs, overriding [`RENDEZVOUS_SERVER`].
+///
+/// The override lives in memory only: [`apply`] stores it into the config, which the next
+/// launch without the argument overwrites back to the build's default server.
+pub fn set_rendezvous_server(server: String) {
+    let _ = RENDEZVOUS_SERVER_ARG.set(server);
+}
+
+/// The server this launch connects to: the command-line override, else the build's default.
+fn rendezvous_server() -> &'static str {
+    match RENDEZVOUS_SERVER_ARG.get() {
+        Some(server) => server.as_str(),
+        None => RENDEZVOUS_SERVER,
+    }
+}
+
 /// Applies the fixed server and id to the runtime configuration.
 ///
 /// Called once at startup, before any of the values is read, so every process of this
-/// build registers as [`PEER_ID`] against [`RENDEZVOUS_SERVER`].
+/// build registers as [`PEER_ID`] against this build's rendezvous server.
 pub fn apply() {
     Config::set_id(PEER_ID);
-    if !RENDEZVOUS_SERVER.is_empty() {
-        *hbb_common::config::EXE_RENDEZVOUS_SERVER.write().unwrap() =
-            RENDEZVOUS_SERVER.to_owned();
-        Config::set_option(
-            "custom-rendezvous-server".to_owned(),
-            RENDEZVOUS_SERVER.to_owned(),
-        );
+    let server = rendezvous_server();
+    if !server.is_empty() {
+        *hbb_common::config::EXE_RENDEZVOUS_SERVER.write().unwrap() = server.to_owned();
+        Config::set_option("custom-rendezvous-server".to_owned(), server.to_owned());
         if !RENDEZVOUS_KEY.is_empty() {
             Config::set_option("key".to_owned(), RENDEZVOUS_KEY.to_owned());
         }
@@ -99,7 +116,8 @@ pub fn apply() {
 /// custom name into the `APP_NAME` RwLock — the probe must answer with the name this
 /// binary will actually use once it finishes initializing. Non-Windows platforms keep the
 /// existing `Config::ipc_path` call because their IPC path has more structure (uid-based
-/// parent directories, per-user sockets) that is hard to duplicate here without more code.
+/// parent directories, per-user sockets) that is hard to duplicate here without more code;
+/// they install the same compile-time name first, for the same reason.
 pub fn instance_already_running() -> bool {
     #[cfg(windows)]
     {
@@ -116,6 +134,10 @@ pub fn instance_already_running() -> bool {
     }
     #[cfg(not(windows))]
     {
+        const CUSTOM: &str = env!("RD_APP_NAME");
+        if !CUSTOM.is_empty() {
+            *hbb_common::config::APP_NAME.write().unwrap() = CUSTOM.to_owned();
+        }
         let path = Config::ipc_path("");
         std::os::unix::net::UnixStream::connect(path).is_ok()
     }
@@ -353,10 +375,10 @@ pub fn log_startup() {
     log::info!(
         "id={} server={} key={} log={}",
         PEER_ID,
-        if RENDEZVOUS_SERVER.is_empty() {
+        if rendezvous_server().is_empty() {
             "<default>"
         } else {
-            RENDEZVOUS_SERVER
+            rendezvous_server()
         },
         if RENDEZVOUS_KEY.is_empty() {
             "<none>"
