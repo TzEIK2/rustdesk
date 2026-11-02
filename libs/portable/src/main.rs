@@ -9,6 +9,8 @@ use bin_reader::{normalize_path, BinaryReader};
 
 pub mod bin_reader;
 #[cfg(windows)]
+mod uac;
+#[cfg(windows)]
 mod ui;
 
 #[cfg(windows)]
@@ -20,7 +22,8 @@ const META_LINE_PREFIX_TIMESTAMP: &str = "timestamp = ";
 const META_LINE_PREFIX_FILE: &str = "file = ";
 // Directory prefix on disk follows the custom app name baked in by the root build script,
 // so each build lives in its own folder and does not clobber a previous one. The CI packs
-// the payload as `<this>.exe`, so `taskkill /IM` on `-force` targets the same name.
+// the payload as `<this>.exe`, the same image name the wrapper runs under, so `-force`
+// terminates the payload by process id and spares the wrapper.
 const APP_PREFIX: &str = env!("RD_APP_NAME");
 #[cfg(windows)]
 const VERIFIED_UPDATE_FILE_PREFIX: &str = "rustdesk-verified-";
@@ -249,34 +252,56 @@ fn is_show(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "-show" || arg == "--show")
 }
 
-/// Kills any running rustdesk.exe payload before we overwrite the extraction directory.
+/// Whether the invocation is a plain unattended launch: no arguments, or only `-force` and
+/// `--server-ip` in the shapes `core_main` accepts. Other launches (`-show`, connect URL,
+/// install, update, quick support) keep their original behavior and are not elevated.
+#[cfg(windows)]
+fn is_bare_launch(args: &[String]) -> bool {
+    let mut args = args.iter().peekable();
+    while let Some(arg) = args.next() {
+        if arg == "--server-ip" || arg == "-server-ip" {
+            if args.peek().is_some_and(|value| !value.starts_with('-')) {
+                let _ = args.next();
+            }
+        } else if arg != "-force"
+            && arg != "--force"
+            && !arg.starts_with("--server-ip=")
+            && !arg.starts_with("-server-ip=")
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Kills any running payload before we overwrite the extraction directory.
 /// Windows keeps an exclusive handle on an exe while it runs, so without this step
 /// `setup()` would fail with ERROR 5 when writing the new payload.
 ///
-/// On Windows we shell out to `taskkill /F /IM rustdesk.exe /T` — this is the simplest way
-/// to terminate every instance of the payload regardless of who launched it (service,
-/// scheduler, double-click). The wait loop polls until the process list is empty so
-/// `setup()` can proceed immediately after.
+/// The wrapper and the payload share one image name, so `taskkill /IM` would terminate
+/// this process too, and a medium-integrity wrapper cannot kill an elevated payload
+/// anyway. Each other instance is therefore terminated by pid. The wait loop polls until
+/// none is left so `setup()` can proceed immediately after.
 ///
 /// On non-Windows the OS does not lock the binary while it runs, so overwrite works
 /// without killing.
 fn kill_running_payloads() {
     #[cfg(windows)]
     {
-        // The payload is packed under the same stem the wrapper extracts and spawns,
-        // so `taskkill /IM` matches exactly this build's process.
         let payload_name = format!("{}.exe", APP_PREFIX);
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/IM", &payload_name, "/T"])
-            .output();
+        let own_pid = std::process::id();
+        for pid in payload_pids(&payload_name) {
+            if pid != own_pid {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/PID", &pid.to_string(), "/T"])
+                    .output();
+            }
+        }
         for _ in 0..50 {
-            let alive = std::process::Command::new("tasklist")
-                .args(["/FI", &format!("IMAGENAME eq {payload_name}")])
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                .unwrap_or_default();
-            if !alive.contains(&payload_name) {
+            if !payload_pids(&payload_name)
+                .into_iter()
+                .any(|pid| pid != own_pid)
+            {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -287,6 +312,39 @@ fn kill_running_payloads() {
         // On Linux/macOS the kernel removes the old binary's inode from the running
         // process on exec, so writing a new file of the same name succeeds. No kill needed.
     }
+}
+
+/// Pids of the running processes whose image name is `payload_name`.
+///
+/// `tasklist` ships with every supported Windows version; `wmic` is absent from Windows 11.
+#[cfg(windows)]
+fn payload_pids(payload_name: &str) -> Vec<u32> {
+    let output = match std::process::Command::new("tasklist")
+        .args([
+            "/FO",
+            "CSV",
+            "/NH",
+            "/FI",
+            &format!("IMAGENAME eq {}", payload_name),
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return Vec::new(),
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let line = line.strip_prefix('"')?.strip_suffix('"')?;
+            let mut fields = line.split("\",\"");
+            let name = fields.next()?;
+            if !name.eq_ignore_ascii_case(payload_name) {
+                return None;
+            }
+            fields.next()?.trim().parse::<u32>().ok()
+        })
+        .collect()
 }
 
 /// Spawns the payload and returns the [`std::process::Child`] handle.
@@ -360,6 +418,14 @@ fn main() -> Result<(), String> {
         }
         i += 1;
     }
+    // The copy started by `relaunch_elevated` carries this marker. Drop it before anything
+    // reads the arguments: the payload must not see it, and its presence is what stops a
+    // copy that still reports itself as non-elevated from starting another attempt.
+    #[cfg(windows)]
+    let already_elevated = args.iter().any(|arg| arg == uac::ELEVATED_FLAG);
+    #[cfg(windows)]
+    args.retain(|arg| arg != uac::ELEVATED_FLAG);
+
     let click_setup = args.is_empty() && arg_exe.to_lowercase().ends_with("install.exe");
     let is_show_run = is_show(&args);
     let force_run = args.iter().any(|arg| arg == "-force" || arg == "--force");
@@ -367,6 +433,23 @@ fn main() -> Result<(), String> {
     let quick_support = args.is_empty() && win::is_quick_support_exe(&arg_exe);
     #[cfg(not(windows))]
     let quick_support = false;
+
+    // A headless launch first tries to obtain administrator rights without a UAC prompt:
+    // `CMSTPLUA` is an auto-elevate COM object, so `CoGetObject` returns an elevated
+    // `ICMLuaUtil` whose `ShellExec` starts this executable again as a high-integrity
+    // child. Windows cannot raise an existing process in place, so that copy takes over
+    // and this one exits. Every failure (not an administrator, "Always notify" policy,
+    // COM or antivirus block) falls through to the unchanged launch below.
+    #[cfg(windows)]
+    if !already_elevated
+        && !click_setup
+        && !quick_support
+        && is_bare_launch(&args)
+        && !uac::is_elevated()
+        && uac::relaunch_elevated(&args)
+    {
+        return Ok(());
+    }
 
     #[cfg(windows)]
     if args.first().is_some_and(|arg| arg == "--update") {

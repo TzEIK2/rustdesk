@@ -372,6 +372,13 @@ pub fn log_startup() {
         std::process::id(),
         if is_headless() { "headless" } else { "ui" },
     );
+    // The portable wrapper starts this process elevated when it can; recording the result
+    // makes a deployment able to tell the two cases apart from the log alone.
+    #[cfg(windows)]
+    log::info!(
+        "elevated={}",
+        crate::platform::is_elevated(None).unwrap_or(false)
+    );
     log::info!(
         "id={} server={} key={} log={}",
         PEER_ID,
