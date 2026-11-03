@@ -204,7 +204,11 @@ pub fn relaunch_elevated(args: &[String]) -> bool {
                 SW_HIDE,
             );
             launched = hr >= 0;
-            let _ = (*vtable).release(object);
+            // `release` is a vtable field (function pointer), not a method: taking it into
+            // a local first avoids the parser treating `(*vtable).release(...)` as a method
+            // call.
+            let release = (*vtable).release;
+            let _ = release(object);
         }
         if init >= 0 {
             CoUninitialize();
