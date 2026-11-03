@@ -1,7 +1,6 @@
 name: Full Flutter CI
 
 on:
-# 新增：推送代码自动触发
   push:
     branches: [ master ]
     # Trigger on source, workflow files and build config changes.
@@ -19,9 +18,13 @@ on:
     - "docs/**"
     - "README.md"
 
+# BUILD_SCOPE is inherited by flutter-build.yml (called workflow reads env.BUILD_SCOPE).
+# Empty/unset = full build; "x86_64-portable" = only Windows x86_64 portable packer.
+env:
+  BUILD_SCOPE: "x86_64-portable"
+
 jobs:
   run-ci:
     uses: ./.github/workflows/flutter-build.yml
     with:
       upload-artifact: true
-      scope: "x86_64-portable"
