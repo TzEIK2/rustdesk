@@ -18,13 +18,11 @@ on:
     - "docs/**"
     - "README.md"
 
-# BUILD_SCOPE is inherited by flutter-build.yml (called workflow reads env.BUILD_SCOPE).
-# Empty/unset = full build; "x86_64-portable" = only Windows x86_64 portable packer.
-env:
-  BUILD_SCOPE: "x86_64-portable"
-
 jobs:
   run-ci:
     uses: ./.github/workflows/flutter-build.yml
     with:
       upload-artifact: true
+      # Build only the Windows x86_64 portable packer path — skips Linux/macOS/
+      # Android/iOS/Web/sciter/publish jobs. Leave unset or set "full" for nightly.
+      BUILD_SCOPE: "x86_64-portable"

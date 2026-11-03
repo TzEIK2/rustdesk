@@ -13,12 +13,8 @@ on:
         type: boolean
         default: false
       # Controls which jobs run. Default "full" runs everything.
-      # "x86_64-portable" runs only the jobs required to build the
-      # Windows x86_64 portable packer (generate-bridge, the small
-      # TempTopMostWindow helper, and one `build-for-windows-flutter`
-      # matrix entry). Everything else is skipped.
-# scope passed via BUILD_SCOPE env from caller workflow (default empty = full)
-
+      # "x86_64-portable" keeps only the Windows x86_64 portable-packer path.
+      BUILD_SCOPE:
         type: string
         default: "full"
 
@@ -105,7 +101,7 @@ jobs:
         run: python res/update/generate_update_metadata.py check-key
 
   generate-sbom:
-    if: ${{ env.BUILD_SCOPE != 'x86_64-portable' }}
+    if: ${{ inputs.BUILD_SCOPE != 'x86_64-portable' }}
     needs: [validate-update-metadata-keys]
     runs-on: ubuntu-latest
 
@@ -149,7 +145,7 @@ jobs:
               target: windows-2022,
               platform: x64,
             }
-          - if: ${{ env.BUILD_SCOPE != 'x86_64-portable' }}
+          - if: ${{ inputs.BUILD_SCOPE != 'x86_64-portable' }}
             target: windows-11-arm,
             platform: ARM64
     with:
@@ -177,7 +173,7 @@ jobs:
               vcpkg-triplet: x64-windows-static,
               build-args: "--vram",
             }
-          - if: ${{ env.BUILD_SCOPE != 'x86_64-portable' }}
+          - if: ${{ inputs.BUILD_SCOPE != 'x86_64-portable' }}
             target: aarch64-pc-windows-msvc
             os: windows-11-arm
             arch: aarch64
@@ -571,7 +567,7 @@ jobs:
 
   # The fallback for the flutter version, we use Sciter for 32bit Windows.
   build-for-windows-sciter:
-    if: ${{ env.BUILD_SCOPE != 'x86_64-portable' }}
+    if: ${{ inputs.BUILD_SCOPE != 'x86_64-portable' }}
     name: ${{ matrix.job.target }} (${{ matrix.job.os }})
     needs: [validate-update-metadata-keys]
     runs-on: ${{ matrix.job.os }}
@@ -753,7 +749,7 @@ jobs:
             ./SignOutput/rustdesk-*.exe
 
   build-rustdesk-ios:
-    if: ${{ env.BUILD_SCOPE != 'x86_64-portable' }} && ${{ inputs.upload-artifact }}
+    if: ${{ inputs.BUILD_SCOPE != 'x86_64-portable' }} && ${{ inputs.upload-artifact }}
     name: build rustdesk ios ipa
     runs-on: ${{ matrix.job.os }}
     needs: [generate-bridge]
@@ -1135,7 +1131,7 @@ jobs:
             rustdesk*-${{ matrix.job.arch }}.dmg
 
   publish-signed-update-metadata:
-    if: ${{ env.BUILD_SCOPE != 'x86_64-portable' }} && ${{ inputs.upload-artifact && inputs.publish-update-metadata && github.repository == 'rustdesk/rustdesk' }}
+    if: ${{ inputs.BUILD_SCOPE != 'x86_64-portable' }} && ${{ inputs.upload-artifact && inputs.publish-update-metadata && github.repository == 'rustdesk/rustdesk' }}
     needs: [build-for-windows-flutter, build-for-windows-sciter, build-for-macOS]
     runs-on: ubuntu-22.04
     concurrency:
@@ -1270,7 +1266,7 @@ jobs:
           files: ./rustdesk-update.json
 
   publish_unsigned:
-    if: ${{ env.BUILD_SCOPE != 'x86_64-portable' }} && ${{ inputs.upload-artifact }}
+    if: ${{ inputs.BUILD_SCOPE != 'x86_64-portable' }} && ${{ inputs.upload-artifact }}
     needs:
       - build-for-macOS
       - build-for-windows-flutter
@@ -1331,7 +1327,7 @@ jobs:
           files: rustdesk-${{ env.VERSION }}-unsigned.tar.gz
 
   build-rustdesk-android:
-    if: ${{ env.BUILD_SCOPE != 'x86_64-portable' }}
+    if: ${{ inputs.BUILD_SCOPE != 'x86_64-portable' }}
     needs: [generate-bridge]
     name: build rustdesk android apk ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.os }}
@@ -1625,7 +1621,7 @@ jobs:
             signed-apk/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}.apk
 
   build-rustdesk-android-universal:
-    if: ${{ env.BUILD_SCOPE != 'x86_64-portable' }} && ${{ inputs.upload-artifact }}
+    if: ${{ inputs.BUILD_SCOPE != 'x86_64-portable' }} && ${{ inputs.upload-artifact }}
     needs: [build-rustdesk-android]
     name: build rustdesk android universal apk
     runs-on: ubuntu-24.04
@@ -1810,7 +1806,7 @@ jobs:
             signed-apk/rustdesk-${{ env.VERSION }}-universal${{ env.suffix }}.apk
 
   build-rustdesk-linux:
-    if: ${{ env.BUILD_SCOPE != 'x86_64-portable' }}
+    if: ${{ inputs.BUILD_SCOPE != 'x86_64-portable' }}
     needs: [generate-bridge]
     name: build rustdesk linux ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.on }}
@@ -2160,7 +2156,7 @@ jobs:
   # old for it. A separate job rather than a matrix entry of build-rustdesk-linux: appimage and
   # flatpak need that job, and a failure here must not skip them.
   build-rustdesk-linux-drm:
-    if: ${{ env.BUILD_SCOPE != 'x86_64-portable' }}
+    if: ${{ inputs.BUILD_SCOPE != 'x86_64-portable' }}
     needs: [generate-bridge]
     name: build rustdesk linux drm x86_64
     runs-on: ubuntu-22.04
@@ -2475,7 +2471,7 @@ jobs:
           path: ${{ env.DRM_DEB }}
 
   build-rustdesk-linux-sciter:
-    if: ${{ env.BUILD_SCOPE != 'x86_64-portable' }} && ${{ inputs.upload-artifact }}
+    if: ${{ inputs.BUILD_SCOPE != 'x86_64-portable' }} && ${{ inputs.upload-artifact }}
     needs: [validate-update-metadata-keys]
     runs-on: ${{ matrix.job.on }}
     name: build-rustdesk-linux-sciter ${{ matrix.job.target }}
@@ -2718,7 +2714,7 @@ jobs:
           path: rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}-sciter.deb
 
   build-appimage:
-    if: ${{ env.BUILD_SCOPE != 'x86_64-portable' }} && ${{ inputs.upload-artifact }}
+    if: ${{ inputs.BUILD_SCOPE != 'x86_64-portable' }} && ${{ inputs.upload-artifact }}
     name: Build appimage ${{ matrix.job.target }}
     needs: [build-rustdesk-linux]
     runs-on: ubuntu-22.04
@@ -2771,7 +2767,7 @@ jobs:
             ./appimage/rustdesk-${{ env.VERSION }}-*.AppImage
 
   build-flatpak:
-    if: ${{ env.BUILD_SCOPE != 'x86_64-portable' }} && ${{ inputs.upload-artifact }}
+    if: ${{ inputs.BUILD_SCOPE != 'x86_64-portable' }} && ${{ inputs.upload-artifact }}
     name: Build flatpak ${{ matrix.job.target }}${{ matrix.job.suffix }}
     needs:
       - build-rustdesk-linux
@@ -2856,7 +2852,7 @@ jobs:
             flatpak/rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.flatpak
 
   build-rustdesk-web:
-    if: ${{ env.BUILD_SCOPE != 'x86_64-portable' }} && False
+    if: ${{ inputs.BUILD_SCOPE != 'x86_64-portable' }} && False
     needs: [validate-update-metadata-keys]
     name: build-rustdesk-web
     runs-on: ubuntu-22.04
