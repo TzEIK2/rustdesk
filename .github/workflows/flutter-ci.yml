@@ -3,7 +3,6 @@ name: Full Flutter CI
 on:
   push:
     branches: [ master ]
-    # Trigger on source, workflow files and build config changes.
     paths:
       - 'src/**'
       - 'libs/**'
@@ -23,6 +22,5 @@ jobs:
     uses: ./.github/workflows/flutter-build.yml
     with:
       upload-artifact: true
-      # Build only the Windows x86_64 portable packer path — skips Linux/macOS/
-      # Android/iOS/Web/sciter/publish jobs. Leave unset or set "full" for nightly.
-      BUILD_SCOPE: "x86_64-portable"
+      # Skip Linux/macOS/Android/iOS/Web/sciter/publish — only build Windows x86_64 portable.
+      PORTABLE_ONLY: true
