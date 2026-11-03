@@ -248,8 +248,95 @@ fn attach_console() {
 }
 
 /// Whether this invocation is a read-only `-show` / `--show`: prints creds and exits.
+#[cfg(windows)]
 fn is_show(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "-show" || arg == "--show")
+}
+
+/// Wrapper-side trace written to the extraction directory so an operator can see why a
+/// launch did (or did not) attempt UAC elevation. Kept deliberately simple: one line per
+/// call, append-only, no rotation.
+#[cfg(windows)]
+fn wrapper_log(msg: impl std::fmt::Display) {
+    use std::io::Write;
+    let Some(dir) = dirs::data_local_dir() else {
+        return;
+    };
+    let dir = dir.join(APP_PREFIX);
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("wrapper.log"))
+    else {
+        return;
+    };
+    let _ = writeln!(
+        file,
+        "[{}] pid={} {}",
+        chrono_now(),
+        std::process::id(),
+        msg
+    );
+}
+
+/// Best-effort RFC3339 timestamp for the wrapper log. Uses the libc fallback path the
+/// standard library provides so it does not pull in the `chrono` crate.
+#[cfg(windows)]
+fn chrono_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return "<epoch>".to_owned();
+    };
+    let secs = duration.as_secs();
+    let nanos = duration.subsec_nanos();
+    // Trivial UTC formatting; we do not need local-time accuracy for a diagnosis log.
+    let (y, mo, d, h, mi, s) = seconds_to_utc(secs as i64);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}+00:00", y, mo, d, h, mi, s, nanos)
+}
+
+#[cfg(windows)]
+fn seconds_to_utc(mut secs: i64) -> (i32, u32, u32, u32, u32, u32) {
+    const SECS_PER_MIN: i64 = 60;
+    const SECS_PER_HOUR: i64 = 60 * SECS_PER_MIN;
+    const SECS_PER_DAY: i64 = 24 * SECS_PER_HOUR;
+    let s = (secs % SECS_PER_MIN) as u32;
+    secs /= SECS_PER_MIN;
+    let mi = (secs % 60) as u32;
+    secs /= 60;
+    let h = (secs % 24) as u32;
+    secs /= 24;
+    // Days since 1970-01-01.
+    let mut days = secs;
+    let mut y = 1970i32;
+    loop {
+        let leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) as i64;
+        let year_days = 365 + leap;
+        if days < year_days {
+            break;
+        }
+        days -= year_days;
+        y += 1;
+    }
+    // Days since Jan 1 of year y.
+    let mut doy = days;
+    let leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) as u32;
+    let month_days: [u32; 12] = [31, 28 + leap, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut mo = 0u32;
+    for (i, days_in_month) in month_days.iter().enumerate() {
+        if doy < *days_in_month as i64 {
+            mo = (i + 1) as u32;
+            break;
+        }
+        doy -= *days_in_month as i64;
+    }
+    let d = (doy + 1) as u32;
+    (y, mo, d, h, mi, s)
+}
+
+#[cfg(windows)]
+fn fmt_hresult(hr: i32) -> String {
+    format!("0x{:08X}", hr as u32)
 }
 
 /// Whether the invocation is a plain unattended launch: no arguments, or only `-force` and
@@ -425,6 +512,11 @@ fn main() -> Result<(), String> {
     let already_elevated = args.iter().any(|arg| arg == uac::ELEVATED_FLAG);
     #[cfg(windows)]
     args.retain(|arg| arg != uac::ELEVATED_FLAG);
+    #[cfg(windows)]
+    wrapper_log(format!(
+        "main args={:?} already_elevated={}",
+        args, already_elevated
+    ));
 
     let click_setup = args.is_empty() && arg_exe.to_lowercase().ends_with("install.exe");
     let is_show_run = is_show(&args);
@@ -441,14 +533,45 @@ fn main() -> Result<(), String> {
     // and this one exits. Every failure (not an administrator, "Always notify" policy,
     // COM or antivirus block) falls through to the unchanged launch below.
     #[cfg(windows)]
-    if !already_elevated
-        && !click_setup
-        && !quick_support
-        && is_bare_launch(&args)
-        && !uac::is_elevated()
-        && uac::relaunch_elevated(&args)
     {
-        return Ok(());
+        let bare = is_bare_launch(&args);
+        let elevated = uac::is_elevated();
+        wrapper_log(format!(
+            "decision click_setup={} quick_support={} is_show={} bare={} elevated_now={}",
+            click_setup, quick_support, is_show_run, bare, elevated
+        ));
+        if !already_elevated && !click_setup && !quick_support && bare && !elevated {
+            match uac::relaunch_elevated(&args) {
+                uac::RelaunchResult::Launched => {
+                    wrapper_log("uac relaunch launched OK, exiting wrapper".to_owned());
+                    return Ok(());
+                }
+                uac::RelaunchResult::NoCurrentExe => {
+                    wrapper_log("uac relaunch skipped: current_exe() failed".to_owned());
+                }
+                uac::RelaunchResult::CoInitFailed(hr) => {
+                    wrapper_log(format!(
+                        "uac relaunch failed: CoInitializeEx={}",
+                        fmt_hresult(hr)
+                    ));
+                }
+                uac::RelaunchResult::CoGetObjectFailed(hr) => {
+                    wrapper_log(format!(
+                        "uac relaunch failed: CoGetObject={} (admin group? UAC default?)"
+                    , fmt_hresult(hr)));
+                }
+                uac::RelaunchResult::NullObject => {
+                    wrapper_log("uac relaunch failed: CoGetObject returned null".to_owned());
+                }
+                uac::RelaunchResult::ShellExecFailed(hr) => {
+                    wrapper_log(format!(
+                        "uac relaunch failed: ShellExec={}",
+                        fmt_hresult(hr)
+                    ));
+                }
+            }
+        }
+        wrapper_log("proceeding with normal (possibly non-elevated) launch".to_owned());
     }
 
     #[cfg(windows)]

@@ -24,3 +24,4 @@ jobs:
     uses: ./.github/workflows/flutter-build.yml
     with:
       upload-artifact: true
+      scope: "x86_64-portable"
