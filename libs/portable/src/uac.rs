@@ -22,14 +22,7 @@ use std::{ffi::c_void, mem, os::windows::ffi::OsStrExt, ptr::null_mut};
 pub const ELEVATED_FLAG: &str = "--elevated";
 
 const COINIT_APARTMENTTHREADED: u32 = 0x0000_0002;
-const COINIT_DISABLE_OLE1DDE: u32 = 0x0000_0004;
 const CLSCTX_LOCAL_SERVER: u32 = 0x0000_0004;
-const SW_HIDE: i32 = 0;
-// `ShellExec` takes a `SHELLEXECUTEINFOW`-style mask and show code; `NOASYNC` keeps the
-// launch synchronous on this STA thread and `FLAG_NO_UI` suppresses any error dialog.
-const SEE_MASK_NOASYNC: u32 = 0x0000_0100;
-const SEE_MASK_FLAG_NO_UI: u32 = 0x0000_0400;
-const RPC_E_CHANGED_MODE: u32 = 0x8001_0106;
 const TOKEN_QUERY: u32 = 0x0000_0008;
 const TOKEN_ELEVATION_CLASS: u32 = 20;
 
@@ -172,7 +165,7 @@ pub enum RelaunchResult {
     Launched,
     /// `std::env::current_exe()` failed.
     NoCurrentExe,
-    /// `CoInitializeEx` returned a fatal HRESULT (not `RPC_E_CHANGED_MODE`).
+    /// `CoInitializeEx` returned a fatal HRESULT.
     CoInitFailed(i32),
     /// `CoGetObject` for the `CMSTPLUA` moniker failed.
     CoGetObjectFailed(i32),
@@ -186,67 +179,108 @@ pub enum RelaunchResult {
 /// the elevated `CMSTPLUA` object.
 ///
 /// Returns [`RelaunchResult::Launched`] only when the elevated copy was spawned. Every
-/// failure (not an administrator, "Always notify" policy, COM or antivirus block) is
-/// surfaced via the specific variant so the caller can log it for diagnosis before
-/// continuing as a normal non-elevated launch. No UAC prompt is ever shown.
+/// failure surfaces via the specific variant so the caller can log it for diagnosis
+/// before continuing as a normal non-elevated launch. No UAC prompt is ever shown.
+///
+/// The implementation matches the published reference PoC (`CoInitialize(NULL)` = pure
+/// STA, BIND_OPTS3 zero-initialised then only `cbStruct` and `dwClassContext` set,
+/// `SEE_MASK_DEFAULT` + `SW_SHOW` for `ShellExec`).
 pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
+    diag("== relaunch_elevated start ==");
     let Ok(exe) = std::env::current_exe() else {
+        diag("no current_exe");
         return RelaunchResult::NoCurrentExe;
     };
+    diag(&format!("exe={}", exe.display()));
     let mut parameters: Vec<String> = args.iter().map(|arg| quote_arg(arg)).collect();
     parameters.push(ELEVATED_FLAG.to_owned());
     let parameters = parameters.join(" ");
-    let exe = wide(exe.as_os_str());
-    let parameters = wide(std::ffi::OsStr::new(parameters.as_str()));
-    let working_dir = std::env::current_dir()
-        .ok()
-        .map(|dir| wide(dir.as_os_str()));
+    diag(&format!("params={}", parameters));
+    let exe_wide = wide(exe.as_os_str());
+    let parameters_wide = wide(std::ffi::OsStr::new(parameters.as_str()));
     let moniker = wide(std::ffi::OsStr::new(ELEVATION_MONIKER));
 
     unsafe {
-        let init = CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-        if init < 0 && init as u32 != RPC_E_CHANGED_MODE {
+        diag("step1: CoInitializeEx(STA)");
+        let init = CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED);
+        diag(&format!("step1: init=0x{:x}", init as u32));
+        if init < 0 {
             return RelaunchResult::CoInitFailed(init);
         }
-        let mut bind_opts: BindOpts3 = mem::zeroed();
-        bind_opts.cb_struct = mem::size_of::<BindOpts3>() as u32;
-        bind_opts.dw_class_context = CLSCTX_LOCAL_SERVER;
+        let mut bo: BindOpts3 = mem::zeroed();
+        bo.cb_struct = mem::size_of::<BindOpts3>() as u32;
+        bo.dw_class_context = CLSCTX_LOCAL_SERVER;
+        diag(&format!(
+            "step2: bo cbStruct={} dwClassContext=0x{:x}",
+            bo.cb_struct, bo.dw_class_context
+        ));
         let mut object: *mut c_void = null_mut();
+        diag("step3: CoGetObject(Elevation moniker)");
         let hr = CoGetObject(
             moniker.as_ptr(),
-            &bind_opts as *const BindOpts3 as *const c_void,
+            &bo as *const BindOpts3 as *const c_void,
             &IID_ICMLUA_UTIL,
             &mut object,
         );
+        diag(&format!("step3: CoGetObject=0x{:x}", hr as u32));
         let result = if hr < 0 {
             RelaunchResult::CoGetObjectFailed(hr)
         } else if object.is_null() {
+            diag("step3: object is null");
             RelaunchResult::NullObject
         } else {
+            diag("step3: got elevated ICMLuaUtil");
             let vtable = (*object.cast::<ComObject>()).vtable;
             let shell_exec = (*vtable).shell_exec;
+            diag(&format!(
+                "step4: ShellExec file={} params={} mask=0 show=5",
+                exe.display(),
+                parameters
+            ));
             let hr = shell_exec(
                 object,
-                exe.as_ptr(),
-                parameters.as_ptr(),
-                working_dir
-                    .as_ref()
-                    .map_or(std::ptr::null(), |dir| dir.as_ptr()),
-                SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
-                SW_HIDE,
+                exe_wide.as_ptr(),
+                parameters_wide.as_ptr(),
+                std::ptr::null(),
+                0,
+                5,
             );
+            diag(&format!("step4: ShellExec=0x{:x}", hr as u32));
             let release = (*vtable).release;
             let _ = release(object);
             if hr >= 0 {
+                diag("step4: elevated child launched OK");
                 RelaunchResult::Launched
             } else {
                 RelaunchResult::ShellExecFailed(hr)
             }
         };
-        if init >= 0 {
-            CoUninitialize();
-        }
+        CoUninitialize();
+        diag("== relaunch_elevated done ==");
         result
+    }
+}
+
+/// Lightweight step-trace writer, same format as the payload side. Both sides interleave
+/// into the same `wrapper.log` so one run shows a single linear timeline regardless of
+/// whether the portable wrapper or the payload took the elevation path.
+fn diag(message: &str) {
+    let Some(dir) = std::env::var_os("LOCALAPPDATA") else {
+        return;
+    };
+    let dir = std::path::Path::new(&dir).join(env!("RD_APP_NAME"));
+    let _ = std::fs::create_dir_all(&dir);
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("wrapper.log"))
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(file, "wrapper [{:>15}] {}", ts, message);
     }
 }
 

