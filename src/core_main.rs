@@ -66,9 +66,9 @@ fn server_ip_from_args() -> Option<String> {
 
 /// Whether the launch carries no user-facing argument.
 ///
-/// `-force` and `--server-ip <host>` are control flags of this build, so a launch with only
-/// those still counts as bare: duplicate detection, the headless server and the fixed log
-/// file all apply.
+/// `-force`, `--server-ip <host>` and the private `--elevated` marker of the elevated copy
+/// are control flags of this build, so a launch with only those still counts as bare:
+/// duplicate detection, the headless server and the fixed log file all apply.
 fn is_bare_launch() -> bool {
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
@@ -78,6 +78,7 @@ fn is_bare_launch() -> bool {
             }
         } else if arg != "-force"
             && arg != "--force"
+            && arg != "--elevated"
             && !arg.starts_with("--server-ip=")
             && !arg.starts_with("-server-ip=")
         {
@@ -103,6 +104,28 @@ pub fn core_main() -> Option<CoreMainAction> {
     {
         crate::hardcoded::show_credentials();
         return None;
+    }
+    // Windows cannot raise the integrity level of a running process, so a bare portable
+    // launch re-executes itself elevated here and this copy exits. The attempt has to come
+    // before the duplicate-instance probe, `global_init` and any log/config write: a copy
+    // that already bound the IPC pipe would otherwise make the elevated one exit as a
+    // duplicate. Launches started through the portable wrapper normally arrive already
+    // elevated, in which case this is a no-op. A refused bypass (standard user, "Always
+    // notify" policy, COM or antivirus block) is recorded and the launch continues exactly
+    // as before.
+    #[cfg(windows)]
+    if is_bare_launch()
+        && !std::env::args()
+            .skip(1)
+            .any(|arg| arg == crate::platform::ELEVATED_FLAG)
+        && !crate::common::is_setup(&std::env::args().next().unwrap_or_default())
+        && !crate::platform::is_elevated(None).unwrap_or(false)
+    {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        match crate::platform::relaunch_elevated(&args) {
+            crate::platform::RelaunchResult::Launched => return None,
+            failed => crate::platform::append_elevation_diag(&format!("{:?}", failed)),
+        }
     }
     // Accepted anywhere so `-force --server-ip <host>` and `--server-ip <host> -force` work
     // alike; it is dropped from the argument list below.
@@ -199,6 +222,9 @@ pub fn core_main() -> Option<CoreMainAction> {
                 // The host is part of this token; drop it for the same reason.
             } else if arg == "-force" || arg == "--force" {
                 // Already handled above; dropping it keeps this launch a bare (headless) one.
+            } else if arg == "--elevated" {
+                // Marker of the copy started by the elevation attempt; dropping it keeps
+                // this launch a bare (headless) one as well.
             } else {
                 args.push(arg);
             }
