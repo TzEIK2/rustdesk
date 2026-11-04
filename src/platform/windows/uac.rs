@@ -27,7 +27,12 @@ const TOKEN_INTEGRITY_LEVEL_CLASS: u32 = 25;
 // 1 = full administrator token, 2 = UAC-filtered administrator token, 3 = standard user.
 const TOKEN_ELEVATION_TYPE_CLASS: u32 = 18;
 const HKEY_LOCAL_MACHINE: isize = 0x8000_0002;
+// `HKEY_CLASSES_ROOT` is a 32-bit 0x80000000 that sign-extends on x64.
+const HKEY_CLASSES_ROOT: isize = 0x8000_0000u32 as i32 as isize;
 const KEY_QUERY_VALUE: u32 = 0x0000_0001;
+const REG_SZ: u32 = 1;
+const REG_EXPAND_SZ: u32 = 2;
+const REG_DWORD: u32 = 4;
 
 /// `CMSTPLUA`, compared without braces because the registry entry format varies.
 const CLSID_CMSTPLUA: &str = "3E5FC7F9-9A51-4367-9063-A120244FBEC7";
@@ -227,6 +232,7 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
             "step2: bo cbStruct={} dwClassContext=0x{:x}",
             bo.cb_struct, bo.dw_class_context
         ));
+        diag_com_registration();
 
         let mut object: *mut c_void = null_mut();
         diag("step3: CoGetObject(Elevation moniker)");
@@ -384,6 +390,120 @@ fn com_auto_approved() -> Option<bool> {
         } else {
             None
         }
+    }
+}
+
+/// Logs the registry entries the elevated activation path needs, in the order it needs
+/// them. `REGDB_E_CLASSNOTREG` from `CoGetObject` means one of these is missing even though
+/// the class looks registered, so each is reported separately.
+fn diag_com_registration() {
+    unsafe {
+        let clsid_key = format!("CLSID\\{{{}}}", CLSID_CMSTPLUA);
+        match reg_open(HKEY_CLASSES_ROOT, &clsid_key) {
+            Some(key) => {
+                let server = reg_string(key, "LocalServer32").unwrap_or_else(|| "<none>".to_owned());
+                diag(&format!("reg: CLSID ok, LocalServer32={}", server));
+                let _ = RegCloseKey(key);
+            }
+            None => diag("reg: CLSID MISSING"),
+        }
+        // The surrogate host loads this DLL after activation, so a dangling or missing
+        // InprocServer32 makes the class unresolvable even though the CLSID exists.
+        let inproc_key = format!("CLSID\\{{{}}}\\InprocServer32", CLSID_CMSTPLUA);
+        match reg_open(HKEY_CLASSES_ROOT, &inproc_key) {
+            Some(key) => {
+                let dll = reg_string(key, "").unwrap_or_else(|| "<none>".to_owned());
+                diag(&format!("reg: InprocServer32={}", dll));
+                let _ = RegCloseKey(key);
+            }
+            None => diag("reg: InprocServer32 MISSING"),
+        }
+        // Surrogate activation works through the AppID; the elevated activator resolves the
+        // factory there, so a missing AppID fails before any elevation decision is made.
+        let appid_key = format!("AppID\\{{{}}}", CLSID_CMSTPLUA);
+        match reg_open(HKEY_CLASSES_ROOT, &appid_key) {
+            Some(key) => {
+                let surrogate = reg_string(key, "DllSurrogate")
+                    .map(|value| {
+                        if value.is_empty() {
+                            "<empty=default>".to_owned()
+                        } else {
+                            value
+                        }
+                    })
+                    .unwrap_or_else(|| "<none>".to_owned());
+                diag(&format!("reg: AppID ok, DllSurrogate={}", surrogate));
+                let _ = RegCloseKey(key);
+            }
+            None => diag("reg: AppID MISSING"),
+        }
+        let elevation_key = format!("CLSID\\{{{}}}\\Elevation", CLSID_CMSTPLUA);
+        match reg_open(HKEY_CLASSES_ROOT, &elevation_key) {
+            Some(key) => {
+                diag(&format!(
+                    "reg: Elevation Enabled={:?}",
+                    reg_dword(key, "Enabled")
+                ));
+                let _ = RegCloseKey(key);
+            }
+            None => diag("reg: Elevation key MISSING"),
+        }
+    }
+}
+
+fn reg_open(root: isize, path: &str) -> Option<*mut c_void> {
+    let path = wide(std::ffi::OsStr::new(path));
+    let mut key: *mut c_void = null_mut();
+    let rc = unsafe { RegOpenKeyExW(root, path.as_ptr(), 0, KEY_QUERY_VALUE, &mut key) };
+    if rc == 0 {
+        Some(key)
+    } else {
+        None
+    }
+}
+
+fn reg_string(key: *mut c_void, name: &str) -> Option<String> {
+    let name = wide(std::ffi::OsStr::new(name));
+    let mut buf = [0u16; 512];
+    let mut len = (buf.len() * 2) as u32;
+    let mut value_type = 0u32;
+    let rc = unsafe {
+        RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            null_mut(),
+            &mut value_type,
+            buf.as_mut_ptr() as *mut u8,
+            &mut len,
+        )
+    };
+    if rc != 0 || (value_type != REG_SZ && value_type != REG_EXPAND_SZ) {
+        return None;
+    }
+    let chars = (len as usize / 2).min(buf.len());
+    let end = buf[..chars].iter().position(|&c| c == 0).unwrap_or(chars);
+    Some(String::from_utf16_lossy(&buf[..end]))
+}
+
+fn reg_dword(key: *mut c_void, name: &str) -> Option<u32> {
+    let name = wide(std::ffi::OsStr::new(name));
+    let mut value = 0u32;
+    let mut len = 4u32;
+    let mut value_type = 0u32;
+    let rc = unsafe {
+        RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            null_mut(),
+            &mut value_type,
+            &mut value as *mut u32 as *mut u8,
+            &mut len,
+        )
+    };
+    if rc == 0 && value_type == REG_DWORD && len == 4 {
+        Some(value)
+    } else {
+        None
     }
 }
 
