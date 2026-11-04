@@ -30,7 +30,6 @@ const SW_HIDE: i32 = 0;
 // launch synchronous on this STA thread and `FLAG_NO_UI` suppresses any error dialog.
 const SEE_MASK_NOASYNC: u32 = 0x0000_0100;
 const SEE_MASK_FLAG_NO_UI: u32 = 0x0000_0400;
-const RPC_E_CHANGED_MODE: u32 = 0x8001_0106;
 const TOKEN_QUERY: u32 = 0x0000_0008;
 const TOKEN_INTEGRITY_LEVEL_CLASS: u32 = 25;
 // 1 = full administrator token, 2 = UAC-filtered administrator token, 3 = standard user.
