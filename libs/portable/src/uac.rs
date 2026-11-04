@@ -24,12 +24,11 @@ pub const ELEVATED_FLAG: &str = "--elevated";
 const COINIT_APARTMENTTHREADED: u32 = 0x0000_0002;
 const COINIT_DISABLE_OLE1DDE: u32 = 0x0000_0004;
 const CLSCTX_LOCAL_SERVER: u32 = 0x0000_0004;
-// `ShellExec` forwards these to `ShellExecuteEx`: `NOASYNC` keeps the call synchronous on
-// this STA thread, so the launched copy exists before the wrapper exits, and `NO_UI`
-// suppresses an error dialog.
+const SW_HIDE: i32 = 0;
+// `ShellExec` takes a `SHELLEXECUTEINFOW`-style mask and show code; `NOASYNC` keeps the
+// launch synchronous on this STA thread and `FLAG_NO_UI` suppresses any error dialog.
 const SEE_MASK_NOASYNC: u32 = 0x0000_0100;
 const SEE_MASK_FLAG_NO_UI: u32 = 0x0000_0400;
-const SW_HIDE: i32 = 0;
 const RPC_E_CHANGED_MODE: u32 = 0x8001_0106;
 const TOKEN_QUERY: u32 = 0x0000_0008;
 const TOKEN_ELEVATION_CLASS: u32 = 20;
@@ -56,12 +55,11 @@ const IID_ICMLUA_UTIL: Guid = Guid {
 
 /// `BIND_OPTS3` — BIND_OPTS + BIND_OPTS2 + BIND_OPTS3.
 ///
-/// **Note:** BIND_OPTS2 extends BIND_OPTS with `dwClassContext` **and** `locale` (LCID),
-/// then BIND_OPTS3 adds `hwnd`. Omitting `locale` causes the field offsets to drift: on
-/// x64 the first four DWORDs consume 20 bytes, then the `hwnd` pointer needs 8-byte
-/// alignment so the compiler inserts a 4-byte padding. If `locale` is missing, that
-/// padding sits where the COM runtime expects LCID and reads garbage from the stack,
-/// which makes `CoGetObject` refuse the elevation moniker with `CO_E_ELEVATION_DISABLED`.
+/// The elevation moniker only reads `hwnd` when `cbStruct` covers the whole
+/// `BIND_OPTS3`, and it refuses to elevate when it cannot see one: the call then fails
+/// with `CO_E_ELEVATION_DISABLED` even though the class is registered as elevatable.
+/// `BIND_OPTS2` is `dwClassContext` + `locale` + `pServerInfo`, so leaving out any of
+/// those shrinks the structure and hides `hwnd` (40 bytes on x64).
 #[allow(dead_code)]
 #[repr(C)]
 struct BindOpts3 {
@@ -71,10 +69,15 @@ struct BindOpts3 {
     dw_tick_count_deadline: u32,
     dw_class_context: u32,
     locale: u32,
+    p_server_info: *mut c_void,
     hwnd: *mut c_void,
 }
 
 /// `IUnknown` (3 slots) + six unused `ICMLuaUtil` methods, then `ShellExec` at slot 9.
+///
+/// `ShellExec` is `(file, parameters, directory, mask, show)`: the fourth argument is a
+/// `SEE_MASK_*` flag set and the fifth a `SW_*` show code. It builds its own
+/// `SHELLEXECUTEINFOW` internally.
 #[allow(dead_code)]
 #[repr(C)]
 struct ComVtable {
@@ -205,14 +208,9 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
         if init < 0 && init as u32 != RPC_E_CHANGED_MODE {
             return RelaunchResult::CoInitFailed(init);
         }
-        // Defensive zeroing: `BIND_OPTS3` has 7 fields followed by pointer-size alignment
-        // padding on x64; `std::mem::zeroed()` guarantees every byte we do not explicitly
-        // set (including the trailing padding and the `locale` field we no longer omit)
-        // starts at zero.
         let mut bind_opts: BindOpts3 = mem::zeroed();
         bind_opts.cb_struct = mem::size_of::<BindOpts3>() as u32;
         bind_opts.dw_class_context = CLSCTX_LOCAL_SERVER;
-        // `hwnd` stays null, `locale` stays 0 (LOCALE_SYSTEM_DEFAULT), the rest stay 0.
         let mut object: *mut c_void = null_mut();
         let hr = CoGetObject(
             moniker.as_ptr(),
