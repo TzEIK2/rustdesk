@@ -219,23 +219,31 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
         .map(|dir| wide(dir.as_os_str()));
     let moniker = wide(std::ffi::OsStr::new(ELEVATION_MONIKER));
 
-    // The reference implementation runs inside explorer.exe and initializes COM with
-    // `CoInitialize(NULL)` — i.e. a single-threaded apartment. The elevation moniker is
-    // sensitive to the apartment model and fails to resolve the class (`0x80040154`)
-    // from the wrong one, so try the apartment models in turn, STA first.
-    let mut last = RelaunchResult::CoGetObjectFailed(-2147221164);
-    for coinit in [
-        COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
-        COINIT_MULTITHREADED,
-    ] {
-        match try_relaunch(coinit, &exe, &parameters, working_dir.as_deref(), &moniker) {
-            failed @ (RelaunchResult::CoGetObjectFailed(_) | RelaunchResult::CoInitFailed(_)) => {
-                last = failed;
+    // The reference PoC does this on a thread it creates itself (`CreateThread` in
+    // `DllMain`), so it always enters a pristine apartment through `CoInitialize(NULL)`.
+    // Our main thread may already be initialized as MTA by the surrounding runtime; then
+    // `CoInitializeEx(STA)` answers `RPC_E_CHANGED_MODE` and the call silently continues in
+    // the MTA, where the elevation moniker cannot resolve the class and fails with
+    // `REGDB_E_CLASSNOTREG`. A fresh thread always starts without an apartment.
+    let worker = std::thread::spawn(move || {
+        let mut last = RelaunchResult::CoGetObjectFailed(-2147221164);
+        for coinit in [
+            COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+            COINIT_MULTITHREADED,
+        ] {
+            match try_relaunch(coinit, &exe, &parameters, working_dir.as_deref(), &moniker) {
+                failed @ (RelaunchResult::CoGetObjectFailed(_)
+                | RelaunchResult::CoInitFailed(_)) => {
+                    last = failed;
+                }
+                other => return other,
             }
-            other => return other,
         }
-    }
-    last
+        last
+    });
+    worker
+        .join()
+        .unwrap_or(RelaunchResult::CoGetObjectFailed(-2147221164))
 }
 
 fn try_relaunch(
