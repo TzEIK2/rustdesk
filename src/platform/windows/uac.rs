@@ -169,6 +169,7 @@ extern "system" {
 extern "system" {
     fn GetCurrentProcess() -> *mut c_void;
     fn CloseHandle(handle: *mut c_void) -> i32;
+    fn ProcessIdToSessionId(process_id: u32, session_id: *mut u32) -> i32;
 }
 
 /// Outcome of a [`relaunch_elevated`] attempt. The variant names match the failing step so
@@ -201,6 +202,7 @@ pub enum RelaunchResult {
 /// normal non-elevated launch. No UAC prompt is ever shown.
 pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
     diag("== relaunch_elevated start ==");
+    diag(&format!("session={}", current_session_id()));
     if let Some(reason) = silent_elevation_blocker() {
         diag(&format!("blocked by precondition: {}", reason));
         return RelaunchResult::Blocked(reason);
@@ -282,7 +284,6 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
         result
     }
 }
-
 
 /// Checks the conditions the `CMSTPLUA` moniker needs for a silent (prompt-free) elevation,
 /// so a doomed COM call is not made and the reason is recorded instead.
@@ -402,7 +403,13 @@ fn diag_com_registration() {
         match reg_open(HKEY_CLASSES_ROOT, &clsid_key) {
             Some(key) => {
                 let server = reg_string(key, "LocalServer32").unwrap_or_else(|| "<none>".to_owned());
-                diag(&format!("reg: CLSID ok, LocalServer32={}", server));
+                // A surrogate-hosted inproc server has no `LocalServer32`; the CLSID's
+                // `AppID` value is what tells COM to host it in `dllhost.exe` instead.
+                let appid = reg_string(key, "AppID").unwrap_or_else(|| "<none>".to_owned());
+                diag(&format!(
+                    "reg: CLSID ok, LocalServer32={} AppID={}",
+                    server, appid
+                ));
                 let _ = RegCloseKey(key);
             }
             None => diag("reg: CLSID MISSING"),
@@ -549,9 +556,10 @@ pub fn append_elevation_diag(message: &str) {
     {
         let _ = writeln!(
             file,
-            "payload: {} build={} elev_type={} integrity=0x{:x} enable_lua={} consent={} auto_approval={}",
+            "payload: {} build={} session={} elev_type={} integrity=0x{:x} enable_lua={} consent={} auto_approval={}",
             message,
             crate::BUILD_DATE,
+            current_session_id(),
             token_u32(TOKEN_ELEVATION_TYPE_CLASS),
             integrity_level(),
             uac_policy_value("EnableLUA"),
@@ -562,6 +570,19 @@ pub fn append_elevation_diag(message: &str) {
                 None => "unknown",
             },
         );
+    }
+}
+
+/// Session the process runs in, `u32::MAX` when unreadable. Session 0 has no interactive
+/// desktop, so the elevated COM server cannot be activated there and `CoGetObject` reports
+/// `REGDB_E_CLASSNOTREG` even though the class is registered correctly.
+fn current_session_id() -> u32 {
+    let mut session = 0u32;
+    let ok = unsafe { ProcessIdToSessionId(std::process::id(), &mut session) };
+    if ok == 0 {
+        u32::MAX
+    } else {
+        session
     }
 }
 
