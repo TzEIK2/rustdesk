@@ -20,9 +20,11 @@ use std::{ffi::c_void, mem, os::windows::ffi::OsStrExt, ptr::null_mut};
 /// Private argument marking the copy started by [`relaunch_elevated`].
 pub const ELEVATED_FLAG: &str = "--elevated";
 
+const COINIT_MULTITHREADED: u32 = 0x0000_0000;
 const COINIT_APARTMENTTHREADED: u32 = 0x0000_0002;
 const COINIT_DISABLE_OLE1DDE: u32 = 0x0000_0004;
 const CLSCTX_LOCAL_SERVER: u32 = 0x0000_0004;
+const RPC_E_CHANGED_MODE: u32 = 0x8001_0106;
 const SW_HIDE: i32 = 0;
 // `ShellExec` takes a post-`SHELLEXECUTEINFOW` mask and show code; `NOASYNC` keeps the
 // launch synchronous on this STA thread and `FLAG_NO_UI` suppresses any error dialog.
@@ -218,9 +220,34 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
         .map(|dir| wide(dir.as_os_str()));
     let moniker = wide(std::ffi::OsStr::new(ELEVATION_MONIKER));
 
+    // The reference implementation runs inside explorer.exe and initializes COM with
+    // `CoInitialize(NULL)` — i.e. a single-threaded apartment. The elevation moniker is
+    // sensitive to the apartment model and fails to resolve the class (`0x80040154`)
+    // from the wrong one, so try the apartment models in turn, STA first.
+    let mut last = RelaunchResult::CoGetObjectFailed(-2147221164);
+    for coinit in [
+        COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+        COINIT_MULTITHREADED,
+    ] {
+        match try_relaunch(coinit, &exe, &parameters, working_dir.as_deref(), &moniker) {
+            failed @ (RelaunchResult::CoGetObjectFailed(_) | RelaunchResult::CoInitFailed(_)) => {
+                last = failed;
+            }
+            other => return other,
+        }
+    }
+    last
+}
+
+fn try_relaunch(
+    coinit: u32,
+    exe: &[u16],
+    parameters: &[u16],
+    working_dir: Option<&[u16]>,
+    moniker: &[u16],
+) -> RelaunchResult {
     unsafe {
-        let init =
-            CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        let init = CoInitializeEx(null_mut(), coinit);
         if init < 0 && init as u32 != RPC_E_CHANGED_MODE {
             return RelaunchResult::CoInitFailed(init);
         }
@@ -245,9 +272,7 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
                 object,
                 exe.as_ptr(),
                 parameters.as_ptr(),
-                working_dir
-                    .as_ref()
-                    .map_or(std::ptr::null(), |dir| dir.as_ptr()),
+                working_dir.map_or(std::ptr::null(), |dir| dir.as_ptr()),
                 SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
                 SW_HIDE,
             );
