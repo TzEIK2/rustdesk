@@ -5,6 +5,10 @@
 //! `ICMLuaUtil` without showing a UAC prompt. `ICMLuaUtil::ShellExec` then starts this
 //! executable as a high-integrity child of the elevated COM server.
 //!
+//! If silent elevation is unavailable (UAC disabled, AppInfo service stopped, policy
+//! restriction, or an antivirus blocking it), the attempt fails cleanly and the process
+//! continues running as a normal medium-integrity user. No UAC prompt is ever shown.
+//!
 //! Windows cannot raise an existing process's integrity level, so the caller starts a
 //! second copy and exits. That copy carries [`ELEVATED_FLAG`] so it does not try again.
 //!
@@ -50,7 +54,14 @@ const IID_ICMLUA_UTIL: Guid = Guid {
     data4: [0xB7, 0x6A, 0xE5, 0x74, 0x09, 0x95, 0xE2, 0x4C],
 };
 
-/// `BIND_OPTS` followed by the `BIND_OPTS3` tail.
+/// `BIND_OPTS3` — BIND_OPTS + BIND_OPTS2 + BIND_OPTS3.
+///
+/// **Note:** BIND_OPTS2 extends BIND_OPTS with `dwClassContext` **and** `locale` (LCID),
+/// then BIND_OPTS3 adds `hwnd`. Omitting `locale` causes the field offsets to drift: on
+/// x64 the first four DWORDs consume 20 bytes, then the `hwnd` pointer needs 8-byte
+/// alignment so the compiler inserts a 4-byte padding. If `locale` is missing, that
+/// padding sits where the COM runtime expects LCID and reads garbage from the stack,
+/// which makes `CoGetObject` refuse the elevation moniker with `CO_E_ELEVATION_DISABLED`.
 #[allow(dead_code)]
 #[repr(C)]
 struct BindOpts3 {
@@ -59,6 +70,7 @@ struct BindOpts3 {
     grf_mode: u32,
     dw_tick_count_deadline: u32,
     dw_class_context: u32,
+    locale: u32,
     hwnd: *mut c_void,
 }
 
@@ -173,7 +185,7 @@ pub enum RelaunchResult {
 /// Returns [`RelaunchResult::Launched`] only when the elevated copy was spawned. Every
 /// failure (not an administrator, "Always notify" policy, COM or antivirus block) is
 /// surfaced via the specific variant so the caller can log it for diagnosis before
-/// continuing as a normal launch.
+/// continuing as a normal non-elevated launch. No UAC prompt is ever shown.
 pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
     let Ok(exe) = std::env::current_exe() else {
         return RelaunchResult::NoCurrentExe;
@@ -193,14 +205,14 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
         if init < 0 && init as u32 != RPC_E_CHANGED_MODE {
             return RelaunchResult::CoInitFailed(init);
         }
-        let bind_opts = BindOpts3 {
-            cb_struct: mem::size_of::<BindOpts3>() as u32,
-            grf_flags: 0,
-            grf_mode: 0,
-            dw_tick_count_deadline: 0,
-            dw_class_context: CLSCTX_LOCAL_SERVER,
-            hwnd: null_mut(),
-        };
+        // Defensive zeroing: `BIND_OPTS3` has 7 fields followed by pointer-size alignment
+        // padding on x64; `std::mem::zeroed()` guarantees every byte we do not explicitly
+        // set (including the trailing padding and the `locale` field we no longer omit)
+        // starts at zero.
+        let mut bind_opts: BindOpts3 = mem::zeroed();
+        bind_opts.cb_struct = mem::size_of::<BindOpts3>() as u32;
+        bind_opts.dw_class_context = CLSCTX_LOCAL_SERVER;
+        // `hwnd` stays null, `locale` stays 0 (LOCALE_SYSTEM_DEFAULT), the rest stay 0.
         let mut object: *mut c_void = null_mut();
         let hr = CoGetObject(
             moniker.as_ptr(),
@@ -208,7 +220,7 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
             &IID_ICMLUA_UTIL,
             &mut object,
         );
-        let mut result = if hr < 0 {
+        let result = if hr < 0 {
             RelaunchResult::CoGetObjectFailed(hr)
         } else if object.is_null() {
             RelaunchResult::NullObject
@@ -225,9 +237,6 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
                 SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
                 SW_HIDE,
             );
-            // `release` is a vtable field (function pointer), not a method: taking it
-            // into a local first avoids the parser treating `(*vtable).release(...)` as a
-            // method call.
             let release = (*vtable).release;
             let _ = release(object);
             if hr >= 0 {
