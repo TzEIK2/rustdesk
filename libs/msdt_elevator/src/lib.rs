@@ -22,6 +22,8 @@ use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr::null_mut};
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
 const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
+const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+const PROCESS_TERMINATE: u32 = 0x0000_0001;
 
 /// Sibling of the dropped DLL, written by the launcher: log path, exe path, parameters,
 /// one per line.
@@ -62,6 +64,21 @@ struct ProcessInformation {
     thread_id: u32,
 }
 
+#[allow(dead_code)]
+#[repr(C)]
+struct ProcessEntry32W {
+    size: u32,
+    usage: u32,
+    process_id: u32,
+    default_heap_id: usize,
+    module_id: u32,
+    threads: u32,
+    parent_process_id: u32,
+    pri_class_base: i32,
+    flags: u32,
+    exe_file: [u16; 260],
+}
+
 #[link(name = "kernel32")]
 extern "system" {
     fn GetModuleHandleExW(flags: u32, name: *const u16, module: *mut *mut c_void) -> i32;
@@ -81,6 +98,11 @@ extern "system" {
     fn GetLastError() -> u32;
     fn CloseHandle(handle: *mut c_void) -> i32;
     fn ExitProcess(code: u32) -> !;
+    fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> *mut c_void;
+    fn Process32FirstW(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
+    fn Process32NextW(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
+    fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> *mut c_void;
+    fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
 }
 
 /// Entry point. This is a CRT initializer rather than `DllMain` on purpose: on 32-bit
@@ -105,9 +127,51 @@ unsafe extern "C" fn attach() {
     {
         run(module);
     }
-    // msdt must never reach its UI, whether the spawn worked or not: the launcher
-    // notices a missing spawn through its own timeout and cleans the drop up.
+    // Kill msdt.exe before exiting sdiagnhost. If msdt outlives its diagnostics host, it
+    // notices the broken RPC channel and pops a fatal "Bluetooth" error dialog. sdiagnhost
+    // runs high-integrity (inherited from the auto-elevated msdt), so it can terminate
+    // msdt directly. A second copy spawned by the new launcher already owns nothing here.
+    kill_msdt();
     ExitProcess(0);
+}
+
+/// Enumerates running processes and terminates every `msdt.exe` instance. The launcher
+/// may have spawned one; any stale copy from a previous attempt must also go so no error
+/// dialog survives this run.
+unsafe fn kill_msdt() {
+    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if snapshot.is_null() {
+        return;
+    }
+    let mut entry: ProcessEntry32W = std::mem::zeroed();
+    entry.size = std::mem::size_of::<ProcessEntry32W>() as u32;
+    if Process32FirstW(snapshot, &mut entry) != 0 {
+        loop {
+            if exe_matches(&entry.exe_file, "msdt.exe") {
+                let handle = OpenProcess(PROCESS_TERMINATE, 0, entry.process_id);
+                if !handle.is_null() {
+                    let _ = TerminateProcess(handle, 0);
+                    let _ = CloseHandle(handle);
+                }
+            }
+            if Process32NextW(snapshot, &mut entry) == 0 {
+                break;
+            }
+        }
+    }
+    let _ = CloseHandle(snapshot);
+}
+
+/// Case-insensitive, null-terminated match between a process-name field and an ASCII
+/// target.
+unsafe fn exe_matches(field: &[u16; 260], target: &str) -> bool {
+    let target = target.encode_utf16().collect::<Vec<_>>();
+    for i in 0..target.len() {
+        if field[i].to_ascii_lowercase() != target[i].to_ascii_lowercase() {
+            return false;
+        }
+    }
+    target.len() == 260 || field[target.len()] == 0
 }
 
 /// Reads the launch parameters from the sibling `.cfg`, spawns the configured
