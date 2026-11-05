@@ -1,0 +1,19 @@
+[package]
+name = "msdt_elevator"
+version = "0.1.0"
+edition = "2021"
+description = "x86 DLL payload for the msdt silent-elevation path"
+
+[lib]
+crate-type = ["cdylib"]
+
+# Standalone crate, outside the main workspace: the CI builds it for
+# i686-pc-windows-msvc in a dedicated step, while every workspace build only targets
+# the host architecture.
+[workspace]
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+lto = true
+strip = true

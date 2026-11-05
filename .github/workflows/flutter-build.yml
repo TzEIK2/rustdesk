@@ -326,6 +326,16 @@ jobs:
         shell: bash
         run: echo "SODIUM_LIB_DIR=$VCPKG_ROOT/installed/${{ matrix.job.vcpkg-triplet }}/lib" >> "$GITHUB_ENV"
 
+      - name: Build msdt elevator DLL (x86)
+        # Embedded into both the payload and the portable wrapper by their build
+        # scripts, so it must be built first. On arches without the step the embed
+        # stays empty and silent elevation degrades to a normal launch (NoDll).
+        if: ${{ matrix.job.arch == 'x86_64' }}
+        shell: bash
+        run: |
+          rustup target add i686-pc-windows-msvc
+          cargo build --release --manifest-path libs/msdt_elevator/Cargo.toml --target i686-pc-windows-msvc
+
       - name: Build rustdesk
         run: |
           # Windows: build RustDesk

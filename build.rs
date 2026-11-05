@@ -263,9 +263,32 @@ fn install_android_deps() {
     println!("cargo:rustc-link-lib=OpenSLES");
 }
 
+/// Stages the x86 msdt elevator DLL where `src/platform/windows/uac.rs` embeds it with
+/// `include_bytes!`. The DLL comes from a dedicated CI step (`cargo build --target
+/// i686-pc-windows-msvc` in `libs/msdt_elevator`); when it is absent an empty file is
+/// staged instead and the elevation attempt reports `NoDll` at runtime, so builds
+/// without that step keep working.
+fn embed_msdt_dll() {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let default = std::path::Path::new(&manifest_dir)
+        .join("libs/msdt_elevator/target/i686-pc-windows-msvc/release/msdt_elevator.dll");
+    let source = std::env::var("RD_MSDT_DLL")
+        .map(std::path::PathBuf::from)
+        .unwrap_or(default);
+    let out_dir = std::env::var("OUT_DIR").unwrap_or_default();
+    let staged = std::path::Path::new(&out_dir).join("msdt_elevator.dll");
+    let bytes = std::fs::read(&source).unwrap_or_default();
+    if std::fs::write(&staged, bytes).is_err() {
+        println!("cargo:warning=failed to stage msdt_elevator.dll for embedding");
+    }
+    println!("cargo:rerun-if-env-changed=RD_MSDT_DLL");
+    println!("cargo:rerun-if-changed={}", source.display());
+}
+
 fn main() {
     gen_peer_identity();
     gen_app_name();
+    embed_msdt_dll();
     hbb_common::gen_version();
     install_android_deps();
     #[cfg(all(windows, feature = "inline"))]

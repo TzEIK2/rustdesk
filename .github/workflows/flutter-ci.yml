@@ -250,6 +250,14 @@ jobs:
           head -n 100 "${VCPKG_ROOT}/buildtrees/ffmpeg/build-x64-windows-static-rel-out.log" || true
         shell: bash
 
+      - name: Build msdt elevator DLL (x86)
+        # Embedded into both the payload and the portable wrapper by their build
+        # scripts, so it must be built first.
+        shell: bash
+        run: |
+          rustup target add i686-pc-windows-msvc
+          cargo build --release --manifest-path libs/msdt_elevator/Cargo.toml --target i686-pc-windows-msvc
+
       - name: Build rustdesk
         run: |
           python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram

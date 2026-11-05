@@ -1,5 +1,7 @@
 /build
 /target
+# Standalone crate (outside the workspace) with its own target dir.
+/libs/msdt_elevator/target
 .vscode
 .idea
 .DS_Store
