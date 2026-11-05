@@ -510,7 +510,9 @@ fn diag_activation_probe() {
     match reg_open(HKEY_CURRENT_USER, &user_key) {
         Some(key) => {
             diag("probe: HKCU CLSID override PRESENT");
-            let _ = RegCloseKey(key);
+            unsafe {
+                let _ = RegCloseKey(key);
+            }
         }
         None => diag("probe: HKCU CLSID override absent"),
     }
