@@ -1,12 +1,15 @@
 //! x86 DLL payload for the msdt silent-elevation path of the launcher.
 //!
-//! `c:\windows\syswow64\msdt.exe -path C:\WINDOWS\diagnostics\index\AudioRecordingDiagnostic.xml -skip yes`
-//! is an auto-elevate binary, and the 32-bit one resolves `AudioDiagnosticUtil.dll`
-//! through `PATH`. The default per-user `PATH` ends with `%LOCALAPPDATA%\Microsoft\
-//! WindowsApps`, a user-writable directory, so the launcher drops this DLL there plus a
-//! sibling `.cfg` carrying what to start. The elevated msdt loads the DLL, which spawns
-//! the configured executable (inheriting msdt's full administrator token) and then
-//! kills msdt before any UI can appear.
+//! `c:\windows\syswow64\msdt.exe -path C:\WINDOWS\diagnostics\index\BluetoothDiagnostic.xml -skip yes`
+//! is an auto-elevate binary. It does not load our DLL directly — msdt spawns
+//! `sdiagnhost.exe`, the actual diagnostics host, which loads
+//! `Bluetooth\DiagPackage.dll` by absolute path. That DLL in turn calls
+//! `LoadLibrary("BluetoothDiagnosticUtil.dll")` by plain name, so the standard DLL
+//! search order reaches `%LOCALAPPDATA%\Microsoft\WindowsApps` (user-writable, at the
+//! end of the default per-user `PATH`) before `C:\Windows\System32`. The launcher
+//! drops this DLL there plus a sibling `.cfg` carrying what to start. The elevated
+//! sdiagnhost loads the DLL, which spawns the configured executable (inheriting the
+//! full administrator token) and kills msdt before any UI can appear.
 //!
 //! Built for `i686-pc-windows-msvc` only: the SysWOW64 msdt.exe is a 32-bit process and
 //! cannot load a 64-bit DLL. Everything is declared by hand so the crate builds with no
@@ -22,10 +25,10 @@ const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
 
 /// Sibling of the dropped DLL, written by the launcher: log path, exe path, parameters,
 /// one per line.
-const CFG_NAME: &str = "AudioDiagnosticUtil.cfg";
+const CFG_NAME: &str = "BluetoothDiagnosticUtil.cfg";
 /// Written only after the spawn succeeded, so the launcher can tell a loaded-but-failed
 /// DLL from a DLL that never loaded.
-const OK_NAME: &str = "AudioDiagnosticUtil.ok";
+const OK_NAME: &str = "BluetoothDiagnosticUtil.ok";
 
 #[allow(dead_code)]
 #[repr(C)]

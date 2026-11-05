@@ -522,9 +522,11 @@ fn main() -> Result<(), String> {
     let quick_support = false;
 
     // A headless launch first tries to obtain administrator rights without a UAC prompt:
-    // the auto-elevate `msdt.exe` resolves `AudioDiagnosticUtil.dll` through `PATH`, so a
-    // drop in the user-writable `WindowsApps` directory makes the elevated msdt load the
-    // embedded elevator DLL, which starts this executable again as a high-integrity
+    // the auto-elevate `msdt.exe` runs BluetoothDiagnostic.xml, which boots
+    // sdiagnhost.exe as admin, which loads Bluetooth\DiagPackage.dll, which
+    // `LoadLibrary`-calls BluetoothDiagnosticUtil.dll by plain name — so a drop in the
+    // user-writable `WindowsApps` PATH entry wins the search and the elevated host loads
+    // the embedded elevator DLL. That DLL starts this executable again as a high-integrity
     // child. Windows cannot raise an existing process in place, so that copy takes over
     // and this one exits. Every failure (not an administrator, "Always notify" policy,
     // msdt missing, antivirus eating the drop) falls through to the unchanged launch
