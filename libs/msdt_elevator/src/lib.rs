@@ -71,8 +71,6 @@ struct ProcessEntry32W {
     usage: u32,
     process_id: u32,
     default_heap_id: usize,
-    module_id: u32,
-    threads: u32,
     parent_process_id: u32,
     pri_class_base: i32,
     flags: u32,

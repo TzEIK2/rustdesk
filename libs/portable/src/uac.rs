@@ -63,6 +63,10 @@ const WINDOWS_APPS_SUBDIR: &str = r"Microsoft\WindowsApps";
 /// covers a slow first start, and beyond it the attempt is declared failed and cleaned up.
 const CONFIRM_TIMEOUT_MS: u64 = 10_000;
 const CONFIRM_POLL_MS: u64 = 250;
+/// Grace period after the spawned msdt stub exits. The stub hands off to the elevated
+/// copy and dies almost immediately, so its exit does not settle the attempt; this
+/// covers the time the elevated copy needs to start sdiagnhost and load the DLL.
+const STUB_EXIT_GRACE_MS: u64 = 5_000;
 
 #[allow(dead_code)]
 #[repr(C)]
@@ -297,21 +301,24 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
     ));
 
     let mut confirmed = false;
+    let mut stub_exit_polls = 0u64;
     for _ in 0..(CONFIRM_TIMEOUT_MS / CONFIRM_POLL_MS) {
         if ok_path.exists() {
             confirmed = true;
             break;
         }
-        // The DLL writes the marker before exiting msdt, so an exited msdt settles the
-        // attempt: either the DLL ran and the marker is there, or the hijack never
-        // triggered and the remaining timeout deadline would only delay the fallback.
+        // The spawned msdt is only the auto-elevation stub: it hands the work to a
+        // second high-integrity msdt and exits within a few hundred milliseconds, long
+        // before sdiagnhost (the process that actually loads our DLL) has started. Its
+        // exit therefore does not mean the hijack failed — cleaning up now would delete
+        // the DLL while the elevated copy is still about to load it. Wait out a grace
+        // window instead, then give up.
         if (unsafe { WaitForSingleObject(pi.process, 0) }) == WAIT_OBJECT_0 {
-            confirmed = ok_path.exists();
-            diag(&format!(
-                "msdt exited, elevator marker present={}",
-                confirmed
-            ));
-            break;
+            stub_exit_polls += 1;
+            if stub_exit_polls * CONFIRM_POLL_MS >= STUB_EXIT_GRACE_MS {
+                diag("msdt stub exited, elevator marker absent after grace window");
+                break;
+            }
         }
         std::thread::sleep(std::time::Duration::from_millis(CONFIRM_POLL_MS));
     }
