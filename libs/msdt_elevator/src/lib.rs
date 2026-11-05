@@ -23,6 +23,9 @@ const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
 /// Sibling of the dropped DLL, written by the launcher: log path, exe path, parameters,
 /// one per line.
 const CFG_NAME: &str = "AudioDiagnosticUtil.cfg";
+/// Written only after the spawn succeeded, so the launcher can tell a loaded-but-failed
+/// DLL from a DLL that never loaded.
+const OK_NAME: &str = "AudioDiagnosticUtil.ok";
 
 #[allow(dead_code)]
 #[repr(C)]
@@ -131,10 +134,11 @@ unsafe fn run(module: *mut c_void) {
     else {
         return;
     };
-    let mut cmdline: Vec<u16> = format!("\"{}\" {}", exe, params)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
+    let mut cmdline: Vec<u16> =
+        std::ffi::OsStr::new(&format!("\"{}\" {}", exe, params))
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
     let mut si: StartupInfoW = std::mem::zeroed();
     si.cb = std::mem::size_of::<StartupInfoW>() as u32;
     let mut pi: ProcessInformation = std::mem::zeroed();
@@ -159,6 +163,7 @@ unsafe fn run(module: *mut c_void) {
         ),
     );
     if ok != 0 {
+        let _ = std::fs::write(dir.join(OK_NAME), pi.process_id.to_string());
         let _ = CloseHandle(pi.thread);
         let _ = CloseHandle(pi.process);
     }
