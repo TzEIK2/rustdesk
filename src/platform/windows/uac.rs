@@ -24,9 +24,11 @@ const COINIT_APARTMENTTHREADED: u32 = 0x0000_0002;
 const CLSCTX_LOCAL_SERVER: u32 = 0x0000_0004;
 const TOKEN_QUERY: u32 = 0x0000_0008;
 const TOKEN_INTEGRITY_LEVEL_CLASS: u32 = 25;
-// 1 = full administrator token, 2 = UAC-filtered administrator token, 3 = standard user.
+// 1 = default (standard user or UAC off), 2 = full administrator token, 3 = filtered
+// administrator token.
 const TOKEN_ELEVATION_TYPE_CLASS: u32 = 18;
 const HKEY_LOCAL_MACHINE: isize = 0x8000_0002;
+const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as i32 as isize;
 // `HKEY_CLASSES_ROOT` is a 32-bit 0x80000000 that sign-extends on x64.
 const HKEY_CLASSES_ROOT: isize = 0x8000_0000u32 as i32 as isize;
 const KEY_QUERY_VALUE: u32 = 0x0000_0001;
@@ -61,6 +63,14 @@ const IID_ICMLUA_UTIL: Guid = Guid {
     data2: 0xC007,
     data3: 0x4E75,
     data4: [0xB7, 0x6A, 0xE5, 0x74, 0x09, 0x95, 0xE2, 0x4C],
+};
+
+/// `CLSID_CMSTPLUA`, the same identity as [`CLSID_CMSTPLUA`] in GUID form.
+const CLSID_CMSTPLUA_GUID: Guid = Guid {
+    data1: 0x3E5F_C7F9,
+    data2: 0x9A51,
+    data3: 0x4367,
+    data4: [0x90, 0x63, 0xA1, 0x20, 0x24, 0x4F, 0xBE, 0xC7],
 };
 
 /// `BIND_OPTS3` — BIND_OPTS + BIND_OPTS2 + BIND_OPTS3.
@@ -122,6 +132,13 @@ extern "system" {
     fn CoGetObject(
         display_name: *const u16,
         bind_opts: *const c_void,
+        riid: *const Guid,
+        object: *mut *mut c_void,
+    ) -> i32;
+    fn CoCreateInstance(
+        clsid: *const Guid,
+        outer: *mut c_void,
+        context: u32,
         riid: *const Guid,
         object: *mut *mut c_void,
     ) -> i32;
@@ -235,6 +252,7 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
             bo.cb_struct, bo.dw_class_context
         ));
         diag_com_registration();
+        diag_activation_probe();
 
         let mut object: *mut c_void = null_mut();
         diag("step3: CoGetObject(Elevation moniker)");
@@ -458,6 +476,46 @@ fn diag_com_registration() {
     }
 }
 
+/// Activates the class in this process without the elevation moniker. The object comes back
+/// at the caller's integrity, so this only answers whether the class, its surrogate and its
+/// DLL can be created at all: a failure here means the registry view or the installation is
+/// broken, while success means the block is in the elevated activation itself.
+fn diag_activation_probe() {
+    unsafe {
+        let mut object: *mut c_void = null_mut();
+        let hr = CoCreateInstance(
+            &CLSID_CMSTPLUA_GUID,
+            null_mut(),
+            CLSCTX_LOCAL_SERVER,
+            &IID_ICMLUA_UTIL,
+            &mut object,
+        );
+        diag(&format!(
+            "probe: CoCreateInstance(local_server)=0x{:x} object_null={}",
+            hr as u32,
+            object.is_null()
+        ));
+        if hr >= 0 && !object.is_null() {
+            let vtable = (*object.cast::<ComObject>()).vtable;
+            let _ = ((*vtable).release)(object);
+        }
+    }
+    let root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from("C:\\Windows"));
+    for dir in ["System32", "SysWOW64"] {
+        let dll = std::path::Path::new(&root).join(dir).join("cmstplua.dll");
+        diag(&format!("probe: {} exists={}", dll.display(), dll.exists()));
+    }
+    let user_key = format!("Software\\Classes\\CLSID\\{{{}}}", CLSID_CMSTPLUA);
+    match reg_open(HKEY_CURRENT_USER, &user_key) {
+        Some(key) => {
+            diag("probe: HKCU CLSID override PRESENT");
+            let _ = RegCloseKey(key);
+        }
+        None => diag("probe: HKCU CLSID override absent"),
+    }
+}
+
 fn reg_open(root: isize, path: &str) -> Option<*mut c_void> {
     let path = wide(std::ffi::OsStr::new(path));
     let mut key: *mut c_void = null_mut();
@@ -573,9 +631,8 @@ pub fn append_elevation_diag(message: &str) {
     }
 }
 
-/// Session the process runs in, `u32::MAX` when unreadable. Session 0 has no interactive
-/// desktop, so the elevated COM server cannot be activated there and `CoGetObject` reports
-/// `REGDB_E_CLASSNOTREG` even though the class is registered correctly.
+/// Session the process runs in, `u32::MAX` when unreadable. Recorded because a session
+/// without an interactive desktop cannot host the elevated COM server.
 fn current_session_id() -> u32 {
     let mut session = 0u32;
     let ok = unsafe { ProcessIdToSessionId(std::process::id(), &mut session) };
