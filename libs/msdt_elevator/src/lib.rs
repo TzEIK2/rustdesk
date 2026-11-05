@@ -163,11 +163,17 @@ unsafe fn kill_msdt() {
 }
 
 /// Case-insensitive, null-terminated match between a process-name field and an ASCII
-/// target.
+/// target. `target` is expected to be lowercase already.
 unsafe fn exe_matches(field: &[u16; 260], target: &str) -> bool {
     let target = target.encode_utf16().collect::<Vec<_>>();
     for i in 0..target.len() {
-        if field[i].to_ascii_lowercase() != target[i].to_ascii_lowercase() {
+        let mut ch = field[i];
+        // ASCII uppercase (A-Z) → lowercase; the DLL's Rust version (1.75) lacks
+        // `u16::to_ascii_lowercase`, so fold the case by hand.
+        if (0x41..=0x5A).contains(&ch) {
+            ch += 0x20;
+        }
+        if ch != target[i] {
             return false;
         }
     }
