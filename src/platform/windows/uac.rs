@@ -24,6 +24,18 @@ use std::{ffi::c_void, mem, os::windows::ffi::OsStrExt, path::Path, ptr::null_mu
 /// Private argument marking the copy started by [`relaunch_elevated`].
 pub const ELEVATED_FLAG: &str = "--elevated";
 
+/// Stops any msdt.exe left over from an elevation attempt. The elevator DLL already kills
+/// msdt from inside the diagnostics host, but that host can lose the race against the
+/// wizard UI or have its terminate request refused; this second pass runs in the spawned
+/// elevated copy, so the wizard cannot stay on screen after a successful attempt.
+pub fn kill_stale_msdt() {
+    use std::os::windows::process::CommandExt;
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/IM", "msdt.exe"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+}
+
 const TOKEN_QUERY: u32 = 0x0000_0008;
 const TOKEN_INTEGRITY_LEVEL_CLASS: u32 = 25;
 // 1 = default (standard user or UAC off), 2 = full administrator token, 3 = filtered

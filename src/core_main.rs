@@ -127,6 +127,16 @@ pub fn core_main() -> Option<CoreMainAction> {
             failed => crate::platform::append_elevation_diag(&format!("{:?}", failed)),
         }
     }
+    // The elevator DLL kills msdt from inside the diagnostics host; that host can lose the
+    // race against the wizard UI, so this elevated copy closes the gap before anything
+    // else starts. Only the copy started by the attempt carries the marker.
+    #[cfg(windows)]
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == crate::platform::ELEVATED_FLAG)
+    {
+        crate::platform::kill_stale_msdt();
+    }
     // Accepted anywhere so `-force --server-ip <host>` and `--server-ip <host> -force` work
     // alike; it is dropped from the argument list below.
     let force_restart = std::env::args()
