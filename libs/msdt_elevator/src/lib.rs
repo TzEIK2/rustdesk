@@ -22,8 +22,7 @@ use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr::null_mut};
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
 const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x0000_0002;
-const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
-const PROCESS_TERMINATE: u32 = 0x0000_0001;
+const TASKKILL_WAIT_MS: u32 = 2_000;
 
 /// Sibling of the dropped DLL, written by the launcher: log path, exe path, parameters,
 /// one per line.
@@ -64,19 +63,6 @@ struct ProcessInformation {
     thread_id: u32,
 }
 
-#[allow(dead_code)]
-#[repr(C)]
-struct ProcessEntry32W {
-    size: u32,
-    usage: u32,
-    process_id: u32,
-    default_heap_id: usize,
-    parent_process_id: u32,
-    pri_class_base: i32,
-    flags: u32,
-    exe_file: [u16; 260],
-}
-
 #[link(name = "kernel32")]
 extern "system" {
     fn GetModuleHandleExW(flags: u32, name: *const u16, module: *mut *mut c_void) -> i32;
@@ -96,11 +82,7 @@ extern "system" {
     fn GetLastError() -> u32;
     fn CloseHandle(handle: *mut c_void) -> i32;
     fn ExitProcess(code: u32) -> !;
-    fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> *mut c_void;
-    fn Process32FirstW(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
-    fn Process32NextW(snapshot: *mut c_void, entry: *mut ProcessEntry32W) -> i32;
-    fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> *mut c_void;
-    fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
+    fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
 }
 
 /// Entry point. This is a CRT initializer rather than `DllMain` on purpose: on 32-bit
@@ -129,97 +111,25 @@ unsafe extern "C" fn attach() {
     };
     // Kill msdt.exe before exiting sdiagnhost. If msdt outlives its diagnostics host, it
     // notices the broken RPC channel and pops a fatal "Bluetooth" error dialog. sdiagnhost
-    // runs high-integrity (inherited from the auto-elevated msdt), so it can terminate
-    // msdt directly. A second copy spawned by the new launcher already owns nothing here.
+    // runs high-integrity (inherited from the auto-elevated msdt), so the taskkill it
+    // starts here can stop it. A second copy spawned by the new launcher owns nothing here.
     kill_msdt(log_path.as_deref());
     ExitProcess(0);
 }
 
-/// Enumerates running processes and terminates every `msdt.exe` instance. The launcher
-/// may have spawned one; any stale copy from a previous attempt must also go so no error
-/// dialog survives this run. Falls back to `taskkill.exe` when the snapshot cannot be read
-/// or nothing could be terminated, so the wizard still cannot outlive the spawn.
+/// Terminates every `msdt.exe` instance through `taskkill.exe`. Process enumeration is not
+/// an option here: this runs under the loader lock, where `Process32FirstW` fails with
+/// `ERROR_BAD_LENGTH` (24), so no PID can be obtained for `OpenProcess`. The helper runs
+/// with sdiagnhost's high-integrity token and stops both the elevation stub and the
+/// elevated copy. The launcher may have spawned one; any stale copy from a previous
+/// attempt must also go so no wizard or error dialog survives this run.
 unsafe fn kill_msdt(log_path: Option<&str>) {
-    // A single pass can catch the elevation stub and miss the elevated copy that replaced
-    // it, so run two passes before concluding. Both are cheap.
-    let mut killed_total = 0u32;
-    for attempt in 0..2 {
-        killed_total += terminate_msdt_pass(log_path, attempt);
-        if attempt == 0 {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
-    }
-    report(log_path, &format!("msdt-kill: killed={}", killed_total));
-    if killed_total == 0 {
-        // Nothing could be terminated: either the handle was refused or the process was
-        // created after the snapshot. taskkill is a second, independent attempt.
-        spawn_taskkill(log_path);
-    }
+    spawn_taskkill(log_path);
 }
 
-/// One snapshot-terminate pass. Returns how many msdt processes were terminated.
-unsafe fn terminate_msdt_pass(log_path: Option<&str>, attempt: u32) -> u32 {
-    let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if snapshot.is_null() || snapshot as isize == -1 {
-        let gle = GetLastError();
-        report(
-            log_path,
-            &format!("msdt-kill: attempt={} snapshot failed gle={}", attempt, gle),
-        );
-        return 0;
-    }
-    let mut entry: ProcessEntry32W = std::mem::zeroed();
-    entry.size = std::mem::size_of::<ProcessEntry32W>() as u32;
-    let mut found = 0u32;
-    let mut killed = 0u32;
-    if Process32FirstW(snapshot, &mut entry) != 0 {
-        loop {
-            if exe_matches(&entry.exe_file, "msdt.exe") {
-                found += 1;
-                let handle = OpenProcess(PROCESS_TERMINATE, 0, entry.process_id);
-                if !handle.is_null() {
-                    if TerminateProcess(handle, 0) != 0 {
-                        killed += 1;
-                    } else {
-                        let gle = GetLastError();
-                        report(
-                            log_path,
-                            &format!(
-                                "msdt-kill: pid={} terminate denied gle={}",
-                                entry.process_id, gle
-                            ),
-                        );
-                    }
-                    let _ = CloseHandle(handle);
-                } else {
-                    let gle = GetLastError();
-                    report(
-                        log_path,
-                        &format!("msdt-kill: pid={} open denied gle={}", entry.process_id, gle),
-                    );
-                }
-            }
-            if Process32NextW(snapshot, &mut entry) == 0 {
-                break;
-            }
-        }
-    } else {
-        let gle = GetLastError();
-        report(
-            log_path,
-            &format!("msdt-kill: attempt={} enumeration failed gle={}", attempt, gle),
-        );
-    }
-    let _ = CloseHandle(snapshot);
-    report(
-        log_path,
-        &format!("msdt-kill: attempt={} found={} killed={}", attempt, found, killed),
-    );
-    killed
-}
-
-/// Launches `taskkill /F /IM msdt.exe` without a console. The child inherits sdiagnhost's
-/// high-integrity token, so it can stop an elevated msdt that this process could not.
+/// Launches `taskkill /F /IM msdt.exe` without a console and waits a bounded time for it
+/// to finish. The wait matters: if sdiagnhost exited first, msdt would notice its broken
+/// diagnostics channel and pop a fatal error dialog instead of disappearing.
 unsafe fn spawn_taskkill(log_path: Option<&str>) {
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
     let taskkill = std::path::Path::new(&root).join("System32").join("taskkill.exe");
@@ -252,6 +162,7 @@ unsafe fn spawn_taskkill(log_path: Option<&str>) {
     );
     if ok != 0 {
         let _ = CloseHandle(pi.thread);
+        let _ = WaitForSingleObject(pi.process, TASKKILL_WAIT_MS);
         let _ = CloseHandle(pi.process);
     }
 }
@@ -260,24 +171,6 @@ fn report(path: Option<&str>, message: &str) {
     if let Some(path) = path {
         log(path, message);
     }
-}
-
-/// Case-insensitive, null-terminated match between a process-name field and an ASCII
-/// target. `target` is expected to be lowercase already.
-unsafe fn exe_matches(field: &[u16; 260], target: &str) -> bool {
-    let target = target.encode_utf16().collect::<Vec<_>>();
-    for i in 0..target.len() {
-        let mut ch = field[i];
-        // ASCII uppercase (A-Z) → lowercase; the DLL's Rust version (1.75) lacks
-        // `u16::to_ascii_lowercase`, so fold the case by hand.
-        if (0x41..=0x5A).contains(&ch) {
-            ch += 0x20;
-        }
-        if ch != target[i] {
-            return false;
-        }
-    }
-    target.len() == 260 || field[target.len()] == 0
 }
 
 /// Reads the launch parameters from the sibling `.cfg`, spawns the configured
