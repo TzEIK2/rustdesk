@@ -49,6 +49,8 @@ const REG_EXPAND_SZ: u32 = 2;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const WAIT_OBJECT_0: u32 = 0;
+const STARTF_USESHOWWINDOW: u32 = 0x0000_0001;
+const SW_HIDE: u16 = 0;
 
 /// The x86 elevator DLL, embedded by `build.rs` from the `libs/msdt_elevator` CI
 /// artifact. Empty when that step did not run (dev builds, non-x86_64 jobs); the
@@ -265,6 +267,12 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
     diag(&format!("launching {}", msdt.display()));
     let mut si: StartupInfoW = unsafe { mem::zeroed() };
     si.cb = mem::size_of::<StartupInfoW>() as u32;
+    // Ask Windows to hide the child's main window. Both the elevation stub and the
+    // elevated copy that AppInfo launches respect STARTF_USESHOWWINDOW, so msdt never
+    // creates a visible wizard. CREATE_NO_WINDOW alone suppresses only the console;
+    // GUI apps still show up unless the startup info says otherwise.
+    si.flags = STARTF_USESHOWWINDOW;
+    si.show_window = SW_HIDE;
     let mut pi: ProcessInformation = unsafe { mem::zeroed() };
     let launched = unsafe {
         CreateProcessW(
