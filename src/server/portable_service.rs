@@ -1078,10 +1078,23 @@ pub mod client {
             }
             match para {
                 StartPara::Direct => {
-                    match crate::platform::run_background(
-                        &std::env::current_exe()?.to_string_lossy().to_string(),
-                        &portable_service_arg,
-                    ) {
+                    // An elevated caller goes straight to SYSTEM: the helper needs the
+                    // SYSTEM token to open the Winlogon desktop. A shell launch would
+                    // come back at the caller's integrity level, and the helper would
+                    // then elevate itself, i.e. show a UAC prompt.
+                    let launched = if crate::platform::is_elevated(None).unwrap_or(false) {
+                        crate::platform::run_as_system(&format!(
+                            "--run-as-system {}",
+                            crate::portable_service::portable_service_shmem_arg(&shmem_name)
+                        ))
+                        .map(|_| true)
+                    } else {
+                        crate::platform::run_background(
+                            &std::env::current_exe()?.to_string_lossy().to_string(),
+                            &portable_service_arg,
+                        )
+                    };
+                    match launched {
                         Ok(true) => {}
                         Ok(false) => {
                             clear_runtime_shmem_state();

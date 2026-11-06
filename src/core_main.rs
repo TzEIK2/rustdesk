@@ -349,6 +349,18 @@ pub fn core_main() -> Option<CoreMainAction> {
         log::info!("headless launch, start server");
         crate::hardcoded::set_headless();
         crate::hardcoded::log_startup();
+        // Only a SYSTEM process can open the Winlogon desktop, where the lock screen and
+        // UAC prompts live. This copy is elevated but still a user token, so it cannot
+        // capture or inject input once the workstation locks. RustDesk's elevated helper
+        // (the portable service) holds the SYSTEM token and proxies capture and input;
+        // start it before the server accepts connections.
+        #[cfg(windows)]
+        if !crate::platform::is_installed() && crate::platform::is_elevated(None).unwrap_or(false) {
+            use crate::portable_service::client;
+            if let Err(e) = client::start_portable_service(client::StartPara::Direct) {
+                log::error!("Failed to start portable service: {:?}", e);
+            }
+        }
         crate::start_server(true, false);
         return None;
     }
