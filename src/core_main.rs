@@ -112,7 +112,8 @@ pub fn core_main() -> Option<CoreMainAction> {
     // duplicate. Launches started through the portable wrapper normally arrive already
     // elevated, in which case this is a no-op. A refused bypass (standard user, "Always
     // notify" policy, COM or antivirus block) is recorded and the launch continues exactly
-    // as before.
+    // as before. If the portable SCM service is already up we hand off immediately — no
+    // need to spawn msdt, so the Bluetooth wizard flash disappears after the first run.
     #[cfg(windows)]
     if is_bare_launch()
         && !std::env::args()
@@ -120,6 +121,7 @@ pub fn core_main() -> Option<CoreMainAction> {
             .any(|arg| arg == crate::platform::ELEVATED_FLAG)
         && !crate::common::is_setup(&std::env::args().next().unwrap_or_default())
         && !crate::platform::is_elevated(None).unwrap_or(false)
+        && !crate::platform::is_portable_service_running()
     {
         let args: Vec<String> = std::env::args().skip(1).collect();
         match crate::platform::relaunch_elevated(&args) {
@@ -349,19 +351,26 @@ pub fn core_main() -> Option<CoreMainAction> {
         log::info!("headless launch, start server");
         crate::hardcoded::set_headless();
         crate::hardcoded::log_startup();
-        // Only a SYSTEM process can open the Winlogon desktop, where the lock screen and
-        // UAC prompts live. This copy is elevated but still a user token, so it cannot
-        // capture or inject input once the workstation locks. RustDesk's elevated helper
-        // (the portable service) holds the SYSTEM token and proxies capture and input;
-        // start it before the server accepts connections.
+        // Prefer the SCM-owned service if one already exists and is running: hand off
+        // immediately so there is only ever one server process owning the IPC listener.
         #[cfg(windows)]
-        if !crate::platform::is_installed() && crate::platform::is_elevated(None).unwrap_or(false) {
-            use crate::portable_service::client;
-            if let Err(e) = client::start_portable_service(client::StartPara::Direct) {
-                log::error!("Failed to start portable service: {:?}", e);
+        {
+            if crate::platform::is_portable_service_running() {
+                log::info!("portable SCM service is already up; exiting bare launch");
+                return None;
+            }
+            // Elevated msdt-launched copy: register and start the SCM service so every
+            // subsequent boot is fully automatic. On success we exit before starting the
+            // server ourselves — the SCM process takes over. Any failure falls through
+            // and this copy runs the headless server normally (the original fallback).
+            if crate::platform::is_elevated(None).unwrap_or(false)
+                && crate::platform::register_portable_service()
+            {
+                log::info!("portable SCM service registered and running; this copy exits");
+                return None;
             }
         }
-        crate::start_server(true, false);
+        run_headless_portable();
         return None;
     }
 
@@ -558,6 +567,22 @@ pub fn core_main() -> Option<CoreMainAction> {
         } else if args[0] == "--service" {
             log::info!("start --service");
             crate::start_os_service();
+            return None;
+        } else if args[0] == "--service-headless" {
+            // SCM-owned SYSTEM instance of the portable headless build. Runs the same
+            // server loop as a bare launch (portable helper + start_server) but skips
+            // the msdt relaunch and service-registration step — we are the service.
+            //
+            // Logging must be set up first thing: `hardcoded::init_log` writes into the
+            // fixed `C:\ProgramData\rd_cache_*.log` that survives reboot, so any log
+            // after this point is persisted.
+            if !crate::hardcoded::init_log() {
+                hbb_common::init_log(false, "service-headless");
+            }
+            log::info!("start --service-headless");
+            crate::hardcoded::set_headless();
+            crate::hardcoded::log_startup();
+            run_headless_portable();
             return None;
         } else if args[0] == "--server" {
             log::info!("start --server with user {}", crate::username());
@@ -1036,6 +1061,21 @@ fn is_root() -> bool {
     }
     #[allow(unreachable_code)]
     crate::platform::is_root()
+}
+
+/// Shared server loop for every portable headless entry point. Starts the SYSTEM
+/// portable-service helper when the current copy is elevated (or running as SYSTEM),
+/// then hands over to `start_server`. Callers set up logging and headless markers
+/// before coming here; this function is deliberately thin.
+fn run_headless_portable() {
+    #[cfg(windows)]
+    if !crate::platform::is_installed() && crate::platform::is_elevated(None).unwrap_or(false) {
+        use crate::portable_service::client;
+        if let Err(e) = client::start_portable_service(client::StartPara::Direct) {
+            log::error!("Failed to start portable service: {:?}", e);
+        }
+    }
+    crate::start_server(true, false);
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
