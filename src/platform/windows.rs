@@ -3924,10 +3924,9 @@ pub fn is_portable_service_running() -> bool {
 // A process launched by the SCM must immediately call `StartServiceCtrlDispatcherW`
 // and report its status, or the SCM declares ERROR_SERVICE_REQUEST_TIMEOUT (1053)
 // and kills it. `start_headless_service` hands the process's main thread to the
-// dispatcher; the real work (logging setup is done by the caller, then portable
-// helper + start_server) runs on the service-main thread the dispatcher spawns.
-// Mirrors the upstream `--service` scaffolding above, minus the session watcher —
-// this build serves headlessly from session 0 and never launches a `--server`.
+// dispatcher; the service-main thread it spawns runs `run_session_server_watcher`,
+// which launches `--session-server-headless` into the active console session (the
+// service process itself stays in session 0 and never serves).
 // ---------------------------------------------------------------------------
 
 define_windows_service!(ffi_headless_service_main, headless_service_main);
@@ -4047,7 +4046,7 @@ pub fn run_session_server_watcher() -> ! {
     loop {
         let active = unsafe { WTSGetActiveConsoleSessionId() };
         let alive = match child {
-            Some((h, _)) => unsafe { WaitForSingleObject(h, 0) } == WAIT_TIMEOUT,
+            Some((h, _)) => unsafe { WaitForSingleObject(h, 0) == WAIT_TIMEOUT },
             None => false,
         };
         if active != 0xFFFF_FFFF {
