@@ -3555,12 +3555,24 @@ fn open_scm(access: u32) -> Option<ScmHandle> {
 /// Build the full binpath string for the SCM service entry: quoted fixed exe
 /// path plus the `--service-headless` flag. The fixed exe must already have been
 /// laid down by [`copy_exe_to_service_dir`] before this is called.
+///
+/// The effective rendezvous server travels inside the binpath: the service runs
+/// under `LocalSystem`, whose profile sees neither the user's config nor the
+/// wrapper's `--server-ip`, so without this it would fall back to the build-time
+/// default server and never register. Re-registration on every elevated launch
+/// refreshes the value through `ChangeServiceConfigW`.
 fn service_binpath() -> ResultType<String> {
     let exe = portable_service_exe_path();
     if !exe.exists() {
         bail!("service exe not found at {}", exe.display());
     }
-    Ok(format!("\"{}\" --service-headless", exe.display()))
+    let mut binpath = format!("\"{}\" --service-headless", exe.display());
+    let server = crate::hardcoded::rendezvous_server();
+    if !server.is_empty() {
+        binpath.push_str(" --server-ip ");
+        binpath.push_str(server);
+    }
+    Ok(binpath)
 }
 
 /// Open an existing service entry with full access, if it is present.

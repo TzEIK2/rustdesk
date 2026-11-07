@@ -1017,10 +1017,19 @@ pub mod client {
             clear_runtime_shmem_state();
             let mut shmem_lock = SHMEM.lock().unwrap();
             let displays = scrap::Display::all()?;
-            if displays.is_empty() {
-                bail!("no display available!");
-            }
             let mut max_pixel = 0;
+            if displays.is_empty() {
+                // A SYSTEM caller in session 0 (the SCM service copy) sees no displays.
+                // The helper it launches lands in the active user session and captures
+                // there, so size the shared memory for a fixed upper bound instead of
+                // failing. For a user-session caller an empty list stays the hard error
+                // it always was.
+                if !crate::platform::is_root() {
+                    bail!("no display available!");
+                }
+                log::warn!("no display in session 0, sizing shared memory for up to 5120x2880");
+                max_pixel = utils::align(5120, 64) * utils::align(2880, 64);
+            }
             let align = 64;
             for d in displays {
                 let resolutions = crate::platform::resolutions(&d.name());

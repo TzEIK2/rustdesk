@@ -65,7 +65,7 @@ pub fn set_rendezvous_server(server: String) {
 }
 
 /// The server this launch connects to: the command-line override, else the build's default.
-fn rendezvous_server() -> &'static str {
+pub(crate) fn rendezvous_server() -> &'static str {
     match RENDEZVOUS_SERVER_ARG.get() {
         Some(server) => server.as_str(),
         None => RENDEZVOUS_SERVER,
