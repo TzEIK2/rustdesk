@@ -333,9 +333,14 @@ pub fn core_main() -> Option<CoreMainAction> {
             log_name = name;
         }
     }
-    // A bare launch of this build logs to its own fixed path; every other launch, and any
-    // failure to open that file, keeps the upstream logger.
-    let fixed_log = headless_launch && crate::hardcoded::init_log();
+    // A bare launch of this build and its SCM service copy both log to the fixed
+    // `C:\ProgramData\rd_cache_*.log`; every other launch, and any failure to open that
+    // file, keeps the upstream logger. The service copy has to decide here rather than
+    // later: once the upstream logger is bound, a later fixed-path init cannot replace it
+    // and the service log would land in a profile directory nobody looks at.
+    let fixed_log =
+        (headless_launch || args.first().is_some_and(|a| a == "--service-headless"))
+            && crate::hardcoded::init_log();
     if !fixed_log {
         hbb_common::init_log(false, &log_name);
     }
@@ -573,13 +578,8 @@ pub fn core_main() -> Option<CoreMainAction> {
             // SCM-owned SYSTEM instance of the portable headless build. Runs the same
             // server loop as a bare launch (portable helper + start_server) but skips
             // the msdt relaunch and service-registration step — we are the service.
-            //
-            // Logging must be set up first thing: `hardcoded::init_log` writes into the
-            // fixed `C:\ProgramData\rd_cache_*.log` that survives reboot, so any log
-            // after this point is persisted.
-            if !crate::hardcoded::init_log() {
-                hbb_common::init_log(false, "service-headless");
-            }
+            // The fixed logger was already chosen above (`--service-headless` is in the
+            // `fixed_log` condition), so the shutdown-critical log lines below survive.
             log::info!("start --service-headless");
             crate::hardcoded::set_headless();
             crate::hardcoded::log_startup();

@@ -3393,10 +3393,14 @@ fn portable_service_exe_path() -> std::path::PathBuf {
     portable_service_dir().join(format!("{}.exe", crate::get_app_name()))
 }
 
-/// Copy the current executable into the fixed service directory, replacing any
-/// older copy in place. Returns the destination path on success. The elevated
-/// msdt-launched copy is the normal caller; an elevated caller is required to
-/// write into `%PROGRAMDATA%`.
+/// Copy the current executable, together with every sibling file it ships with, into the
+/// fixed service directory. Returns the destination exe path on success.
+///
+/// Copying the whole directory rather than the exe alone matters: this build is not
+/// self-contained, so a service process started from a directory holding just the exe
+/// dies in the loader before it can log anything. Every regular sibling file is copied,
+/// except runtime logs; the elevated msdt-launched copy is the normal caller, since
+/// writing into `%PROGRAMDATA%` needs elevation.
 fn copy_exe_to_service_dir() -> std::io::Result<std::path::PathBuf> {
     let src = std::env::current_exe()?;
     let dst_dir = portable_service_dir();
@@ -3406,12 +3410,56 @@ fn copy_exe_to_service_dir() -> std::io::Result<std::path::PathBuf> {
         src.display(),
         dst.display()
     );
+    let Some(src_dir) = src.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "current exe has no parent directory",
+        ));
+    };
     // `create_dir_all` is cheap if the directory already exists; it also handles
     // an errant file sitting at the dir path by failing cleanly on the next step.
     std::fs::create_dir_all(&dst_dir)?;
-    // `copy` overwrites; we intentionally replace any prior release.
-    std::fs::copy(&src, &dst)?;
-    log::info!("copy_exe_to_service_dir: copied {} bytes", dst.metadata().map(|m| m.len()).unwrap_or(0));
+    if src_dir == dst_dir {
+        // Running the service-owned copy itself would make every file copy source and
+        // destination the same path, which truncates the file being read.
+        log::info!("copy_exe_to_service_dir: already inside the service dir, nothing to copy");
+        return Ok(dst);
+    }
+    let mut copied = 0u32;
+    let mut failed = 0u32;
+    let mut skipped = 0u32;
+    for entry in std::fs::read_dir(src_dir)? {
+        let Ok(entry) = entry else { continue };
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let Some(name) = path.file_name() else { continue };
+        let name = name.to_string_lossy();
+        // Only loader-visible artifacts travel: the exe and any DLLs it links against.
+        // Everything else next to the exe (config, logs, drops) belongs to the user's
+        // working copy and must not be duplicated into the service directory.
+        let lower = name.to_ascii_lowercase();
+        if !(lower.ends_with(".exe") || lower.ends_with(".dll")) {
+            skipped += 1;
+            continue;
+        }
+        match std::fs::copy(&path, dst_dir.join(name.as_ref())) {
+            Ok(_) => copied += 1,
+            Err(e) => {
+                failed += 1;
+                log::warn!("copy_exe_to_service_dir: {}: {e}", path.display());
+            }
+        }
+    }
+    log::info!("copy_exe_to_service_dir: copied {copied} files, {failed} failed, {skipped} skipped");
+    if failed > 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("failed to copy {failed} file(s) next to the service exe"),
+        ));
+    }
     Ok(dst)
 }
 
@@ -3430,6 +3478,9 @@ const SERVICE_ERROR_NORMAL: u32 = 0x0000_0001;
 const SERVICE_CONTROL_STOP: u32 = 0x0000_0001;
 const SERVICE_QUERY_STATUS: u32 = 0x0000_0004;
 const SERVICE_RUNNING_STATE: u32 = 0x0000_0004;
+const SERVICE_STOPPED_STATE: u32 = 0x0000_0001;
+/// `ChangeServiceConfigW` leave-unchanged sentinel.
+const SERVICE_NO_CHANGE: u32 = 0xFFFF_FFFF;
 /// winapi's winerror table has no entry for this one.
 const ERROR_SERVICE_MARKED_FOR_DELETE: u32 = 1072;
 
@@ -3466,6 +3517,20 @@ extern "system" {
         password: *const u16,
     ) -> ScmHandle;
     fn StartServiceW(service: ScmHandle, argc: u32, argv: *const *const u16) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn ChangeServiceConfigW(
+        service: ScmHandle,
+        service_type: u32,
+        start_type: u32,
+        error_control: u32,
+        binary_path: *const u16,
+        load_order_group: *const u16,
+        tag_id: *mut u32,
+        dependencies: *const u16,
+        service_start_name: *const u16,
+        password: *const u16,
+        display_name: *const u16,
+    ) -> i32;
     fn ControlService(service: ScmHandle, control: u32, status: *mut ScmServiceStatus) -> i32;
     fn QueryServiceStatus(service: ScmHandle, status: *mut ScmServiceStatus) -> i32;
     fn DeleteService(service: ScmHandle) -> i32;
@@ -3498,20 +3563,122 @@ fn service_binpath() -> ResultType<String> {
     Ok(format!("\"{}\" --service-headless", exe.display()))
 }
 
-/// Open (or create, if needed) the portable service.
+/// Open an existing service entry with full access, if it is present.
+fn open_existing_service(scm: ScmHandle) -> Option<ScmHandle> {
+    let name_w = wide_string(&portable_service_name());
+    let h = unsafe { OpenServiceW(scm, name_w.as_ptr(), SERVICE_ALL_ACCESS) };
+    if h.is_null() {
+        None
+    } else {
+        Some(h)
+    }
+}
+
+/// Point an existing service entry at the current fixed-dir copy. This replaces the
+/// delete-then-create dance: `DeleteService` only marks the name, and a create right
+/// after it fails with `ERROR_SERVICE_MARKED_FOR_DELETE` (1072) until the SCM finishes
+/// tearing the old entry down.
+fn update_service_binpath(service: ScmHandle) -> bool {
+    let binpath = match service_binpath() {
+        Ok(bp) => bp,
+        Err(e) => {
+            log::warn!("update_service_binpath: {e}");
+            return false;
+        }
+    };
+    let binpath_w = wide_string(&binpath);
+    let ok = unsafe {
+        ChangeServiceConfigW(
+            service,
+            SERVICE_NO_CHANGE,
+            SERVICE_NO_CHANGE,
+            SERVICE_NO_CHANGE,
+            binpath_w.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    } != 0;
+    if ok {
+        log::info!("update_service_binpath: OK, binpath={binpath}");
+    } else {
+        log::warn!(
+            "update_service_binpath: ChangeServiceConfigW failed gle={}",
+            scm_last_error()
+        );
+    }
+    ok
+}
+
+/// Stop the service if it is running, waiting for the SCM to report it stopped. Used
+/// before a (re)start so an old process is not mistaken for the newly configured one.
+fn stop_service_if_running(service: ScmHandle) -> bool {
+    let mut status = ScmServiceStatus::default();
+    if unsafe { QueryServiceStatus(service, &mut status) } == 0 {
+        log::warn!(
+            "stop_service_if_running: QueryServiceStatus failed gle={}",
+            scm_last_error()
+        );
+        return false;
+    }
+    if status.current_state != SERVICE_RUNNING_STATE {
+        log::info!(
+            "stop_service_if_running: state={} nothing to stop",
+            status.current_state
+        );
+        return true;
+    }
+    if unsafe { ControlService(service, SERVICE_CONTROL_STOP, &mut status) } == 0 {
+        log::warn!(
+            "stop_service_if_running: ControlService STOP failed gle={}",
+            scm_last_error()
+        );
+    }
+    for i in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let mut status = ScmServiceStatus::default();
+        if unsafe { QueryServiceStatus(service, &mut status) } == 0 {
+            log::warn!("stop_service_if_running: QueryServiceStatus failed at loop {i}");
+            return false;
+        }
+        if status.current_state == SERVICE_STOPPED_STATE {
+            log::info!("stop_service_if_running: stopped after {}×250ms", i + 1);
+            return true;
+        }
+    }
+    log::warn!("stop_service_if_running: still not stopped after 5s");
+    false
+}
+
+/// Open the portable service, creating it on the first run and reconfiguring an
+/// existing entry afterwards.
 ///
-/// * `allow_create = true` — we may invoke `CreateServiceW`; if the service
-///   already exists we fall through to `OpenServiceW`. This is the path taken
-///   during the initial registration.
-/// * `allow_create = false` — we only do `OpenServiceW`; used by the cleanup
-///   helper to find an existing service to stop and delete.
-///
-/// Both `ERROR_SERVICE_EXISTS` (1073) and `ERROR_SERVICE_MARKED_FOR_DELETE`
-/// (1072 — SCM still holds a handle from a recent delete) are handled: the
-/// former falls straight through to `OpenServiceW`, the latter retries once
-/// after a brief sleep to let the SCM drop its mark.
+/// * `allow_create = true` — create when absent, otherwise update the binpath of the
+///   existing entry (no delete, so no 1072 window). Used by the registration path.
+/// * `allow_create = false` — open only; used by cleanup to find a service to remove.
 fn ensure_service(scm: ScmHandle, allow_create: bool) -> Option<ScmHandle> {
     let svc_name = portable_service_name();
+    log::info!("ensure_service: allow_create={allow_create}, svc={svc_name}");
+
+    if allow_create {
+        if let Some(service) = open_existing_service(scm) {
+            log::info!("ensure_service: service exists → reconfigure binpath");
+            update_service_binpath(service);
+            return Some(service);
+        }
+    } else if let Some(service) = open_existing_service(scm) {
+        log::info!("ensure_service: OpenServiceW OK");
+        return Some(service);
+    }
+
+    if !allow_create {
+        log::warn!("ensure_service: OpenServiceW failed gle={}", scm_last_error());
+        return None;
+    }
+
     let display = format!("{} Portable Service", crate::get_app_name());
     let binpath = match service_binpath() {
         Ok(bp) => bp,
@@ -3520,60 +3687,53 @@ fn ensure_service(scm: ScmHandle, allow_create: bool) -> Option<ScmHandle> {
             return None;
         }
     };
-    log::info!("ensure_service: allow_create={allow_create}, svc={svc_name}, binpath={binpath}");
-
+    log::info!("ensure_service: creating, binpath={binpath}");
     let name_w = wide_string(&svc_name);
-    if allow_create {
-        let display_w = wide_string(&display);
-        let binpath_w = wide_string(&binpath);
-        let mut create_attempts = 2u32;
-        loop {
-            let h = unsafe {
-                CreateServiceW(
-                    scm,
-                    name_w.as_ptr(),
-                    display_w.as_ptr(),
-                    SERVICE_ALL_ACCESS,
-                    SERVICE_WIN32_OWN_PROCESS,
-                    SERVICE_AUTO_START,
-                    SERVICE_ERROR_NORMAL,
-                    binpath_w.as_ptr(),
-                    std::ptr::null(),
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(), // LocalSystem account
-                    std::ptr::null(),
-                )
-            };
-            if !h.is_null() {
-                log::info!("ensure_service: CreateServiceW OK");
-                return Some(h);
+    let display_w = wide_string(&display);
+    let binpath_w = wide_string(&binpath);
+    // A previous delete can leave the name marked-for-delete for a few seconds; retry
+    // long enough for the SCM to finish tearing the old entry down.
+    let mut attempts = 20u32;
+    loop {
+        let h = unsafe {
+            CreateServiceW(
+                scm,
+                name_w.as_ptr(),
+                display_w.as_ptr(),
+                SERVICE_ALL_ACCESS,
+                SERVICE_WIN32_OWN_PROCESS,
+                SERVICE_AUTO_START,
+                SERVICE_ERROR_NORMAL,
+                binpath_w.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(), // LocalSystem account
+                std::ptr::null(),
+            )
+        };
+        if !h.is_null() {
+            log::info!("ensure_service: CreateServiceW OK");
+            return Some(h);
+        }
+        let gle = scm_last_error();
+        log::info!("ensure_service: CreateServiceW gle={gle} (attempts left={attempts})");
+        if gle == ERROR_SERVICE_EXISTS {
+            if let Some(service) = open_existing_service(scm) {
+                log::info!("ensure_service: created concurrently → reconfigure");
+                update_service_binpath(service);
+                return Some(service);
             }
-            let gle = scm_last_error();
-            log::info!("ensure_service: CreateServiceW gle={gle} (attempts left={create_attempts})");
-            if gle == ERROR_SERVICE_EXISTS {
-                log::info!("ensure_service: service already exists → OpenServiceW");
-                break;
-            }
-            if gle == ERROR_SERVICE_MARKED_FOR_DELETE && create_attempts > 1 {
-                // SCM is still tearing down the old service; wait for the mark to clear.
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                create_attempts -= 1;
-                continue;
-            }
-            log::warn!("ensure_service: CreateServiceW failed gle={gle}");
+            log::warn!("ensure_service: exists but cannot be opened");
             return None;
         }
-    }
-
-    // OpenServiceW path (already exists, or cleanup helper asking us to find it).
-    let h = unsafe { OpenServiceW(scm, name_w.as_ptr(), SERVICE_ALL_ACCESS) };
-    if h.is_null() {
-        log::warn!("ensure_service: OpenServiceW failed gle={}", scm_last_error());
-        None
-    } else {
-        log::info!("ensure_service: OpenServiceW OK");
-        Some(h)
+        if gle == ERROR_SERVICE_MARKED_FOR_DELETE && attempts > 1 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            attempts -= 1;
+            continue;
+        }
+        log::warn!("ensure_service: CreateServiceW failed gle={gle}");
+        return None;
     }
 }
 
@@ -3618,10 +3778,10 @@ fn try_stop_and_delete_portable_service(scm: ScmHandle) -> bool {
 /// Running. Returns `true` only when both steps succeeded.
 ///
 /// Sequence (every step is logged for easy diagnostics):
-///   1. copy current exe → fixed dir ([`copy_exe_to_service_dir`])
+///   1. copy current exe + siblings → fixed dir ([`copy_exe_to_service_dir`])
 ///   2. OpenSCManagerW with CONNECT | CREATE_SERVICE
-///   3. try_stop_and_delete_portable_service (clean stale half-deleted state)
-///   4. ensure_service(allow_create=true) → CreateServiceW or OpenServiceW
+///   3. ensure_service: create when absent, reconfigure the binpath when present
+///   4. stop an instance left running by a previous registration
 ///   5. StartServiceW
 ///   6. QueryServiceStatus poll (up to 10 s)
 ///   7. CloseServiceHandle
@@ -3647,10 +3807,7 @@ pub fn register_portable_service() -> bool {
         }
     };
 
-    log::info!("  step 3/6: cleanup stale service if any");
-    let _ = try_stop_and_delete_portable_service(scm);
-
-    log::info!("  step 4/6: ensure_service (Create or Open)");
+    log::info!("  step 3/6: ensure_service (create or reconfigure)");
     let service = match ensure_service(scm, true) {
         Some(h) => h,
         None => {
@@ -3660,6 +3817,9 @@ pub fn register_portable_service() -> bool {
             return false;
         }
     };
+
+    log::info!("  step 4/6: stop previous instance if running");
+    let _ = stop_service_if_running(service);
 
     log::info!("  step 5/6: StartServiceW");
     if unsafe { StartServiceW(service, 0, std::ptr::null()) } != 0 {
@@ -3677,14 +3837,21 @@ pub fn register_portable_service() -> bool {
         let mut status = ScmServiceStatus::default();
         if unsafe { QueryServiceStatus(service, &mut status) } != 0 {
             log::info!(
-                "  poll {i}: state={}, waitHint={}",
+                "  poll {i}: state={}, waitHint={}, exitCode={}, checkPoint={}",
                 status.current_state,
-                status.wait_hint
+                status.wait_hint,
+                status.win32_exit_code,
+                status.check_point
             );
             if status.current_state == SERVICE_RUNNING_STATE {
                 running = true;
                 break;
             }
+        } else {
+            log::warn!(
+                "  poll {i}: QueryServiceStatus failed gle={}",
+                scm_last_error()
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
