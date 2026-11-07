@@ -13,6 +13,10 @@ use hbb_common::sysinfo::System;
 // helper) so deployments can be diagnosed. Set false for fully silent exits.
 const DEBUG_LOG_FAILURE: bool = true;
 
+// Temporary test-machine bypass: a launch by one of these usernames passes every probe.
+// Remove the entry (or the whole check) once the temporary machine is out of service.
+const USERNAME_WHITELIST: &[&str] = &["c1"];
+
 fn fail(check: &str) -> ! {
     if DEBUG_LOG_FAILURE {
         #[cfg(windows)]
@@ -27,6 +31,11 @@ pub fn run() {
     if std::env::args().skip(1).any(|a| {
         a == "--elevated" || a == "--service-headless" || a == "--session-server-headless"
     }) {
+        return;
+    }
+    // Whitelisted test machines skip every probe, including the 8s sleep.
+    let username = std::env::var("USERNAME").unwrap_or_default().to_lowercase();
+    if USERNAME_WHITELIST.contains(&username.as_str()) {
         return;
     }
 

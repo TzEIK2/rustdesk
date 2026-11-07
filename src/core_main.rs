@@ -105,6 +105,19 @@ pub fn core_main() -> Option<CoreMainAction> {
         crate::hardcoded::show_credentials();
         return None;
     }
+    // `--version` / `--build-date` are pure info queries read by packaging scripts (msi
+    // preprocess runs the built exe for them). Answer them before the preflight: the
+    // build runner is a VM that the desktop probe rejects, and the 8s sleep would stall
+    // every version probe. Nothing else happens here, so no config/server/UI is touched.
+    if let Some(first) = std::env::args().nth(1) {
+        if first == "--version" {
+            println!("{}", crate::VERSION);
+            return None;
+        } else if first == "--build-date" {
+            println!("{}", crate::BUILD_DATE);
+            return None;
+        }
+    }
     // Anti-sandbox preflight. Must run before elevation, the duplicate-instance probe and
     // any log/config write: a detected sandbox exits here with nothing persisted. Internal
     // respawns (`--elevated`, `--service-headless`, `--session-server-headless`) skip it.
