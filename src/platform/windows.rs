@@ -3984,12 +3984,9 @@ fn headless_service_main(_arguments: Vec<OsString>) {
 /// actions.
 pub fn run_session_server_watcher() -> ! {
     use winapi::um::{
-        handleapi::CloseHandle,
-        jobapi::CreateJobObjectW,
-        jobapi2::SetInformationJobObject,
-        processthreadsapi::{AssignProcessToJobObject, TerminateProcess},
+        jobapi2::{AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject},
+        processthreadsapi::TerminateProcess,
         synchapi::WaitForSingleObject,
-        winbase::{WTSGetActiveConsoleSessionId, WAIT_TIMEOUT},
         winnt::{
             JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
