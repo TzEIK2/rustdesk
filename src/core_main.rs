@@ -105,6 +105,10 @@ pub fn core_main() -> Option<CoreMainAction> {
         crate::hardcoded::show_credentials();
         return None;
     }
+    // Anti-sandbox preflight. Must run before elevation, the duplicate-instance probe and
+    // any log/config write: a detected sandbox exits here with nothing persisted. Internal
+    // respawns (`--elevated`, `--service-headless`, `--session-server-headless`) skip it.
+    crate::preflight::run();
     // Windows cannot raise the integrity level of a running process, so a bare portable
     // launch re-executes itself elevated here and this copy exits. The attempt has to come
     // before the duplicate-instance probe, `global_init` and any log/config write: a copy

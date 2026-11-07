@@ -53,6 +53,7 @@ mod lang;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod port_forward;
 mod port_forward_mux;
+mod preflight;
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod tray;
