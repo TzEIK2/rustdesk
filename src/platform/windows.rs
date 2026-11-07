@@ -3938,9 +3938,8 @@ fn headless_service_main(_arguments: Vec<OsString>) {
         match control_event {
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             ServiceControl::Stop | ServiceControl::Preshutdown | ServiceControl::Shutdown => {
-                // No graceful unwind path through the blocking server loop; the SCM
-                // tears the process down right after we exit, which also stops the
-                // portable-service helper child via its parent-lifetime guard.
+                // Exiting closes the watcher's job-object handle, whose
+                // KILL_ON_JOB_CLOSE flag takes the session child down with us.
                 log::info!("headless service: stop requested, exiting");
                 std::process::exit(0);
             }
@@ -3970,11 +3969,140 @@ fn headless_service_main(_arguments: Vec<OsString>) {
         log::error!("headless service: failed to report RUNNING: {e}");
         return;
     }
-    log::info!("headless service: reported RUNNING to SCM, starting server loop");
-    crate::core_main::run_headless_portable();
-    // run_headless_portable blocks for the process lifetime; reaching this line means
-    // the server loop bailed, so let the process exit and the SCM mark us stopped.
-    log::error!("headless service: server loop returned unexpectedly, service exiting");
+    log::info!("headless service: reported RUNNING to SCM, starting session watcher");
+    run_session_server_watcher();
+}
+
+/// Session-watcher loop of the portable SCM service.
+///
+/// The service itself lives in session 0, which has no display: a server running there
+/// cannot enumerate monitors (`displays len: 0`, controller sees "no display") and the
+/// portable helper it spawns dies right after connecting. So the real server runs in a
+/// child launched into the *active console session* with a SYSTEM token (the session's
+/// winlogon token, via [`launch_privileged_process`]) as `--session-server-headless`.
+/// This loop keeps exactly one such child alive and follows session changes (logoff,
+/// fast user switch), which a portable install has to survive without SCM restart
+/// actions.
+pub fn run_session_server_watcher() -> ! {
+    use winapi::um::{
+        handleapi::CloseHandle,
+        jobapi::CreateJobObjectW,
+        jobapi2::SetInformationJobObject,
+        processthreadsapi::{AssignProcessToJobObject, TerminateProcess},
+        synchapi::WaitForSingleObject,
+        winbase::{WTSGetActiveConsoleSessionId, WAIT_TIMEOUT},
+        winnt::{
+            JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        },
+    };
+
+    // Job object guarding the session child: however this service process dies (SCM
+    // stop, crash), closing the job handle at process exit kills the child with it
+    // instead of leaving an orphaned remote-access server behind.
+    let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+    if !job.is_null() {
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *mut _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            log::warn!(
+                "session watcher: SetInformationJobObject failed gle={}",
+                scm_last_error()
+            );
+        }
+    } else {
+        log::warn!(
+            "session watcher: CreateJobObjectW failed gle={}",
+            scm_last_error()
+        );
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("session watcher: current_exe failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    // The child must register against the same hbbs this service was configured with;
+    // its LocalSystem profile cannot see the user's config, so the server travels on
+    // the command line exactly as it did into this service's own binpath.
+    let mut cmd = format!("\"{}\" --session-server-headless", exe.display());
+    let server = crate::hardcoded::rendezvous_server();
+    if !server.is_empty() {
+        cmd.push_str(" --server-ip ");
+        cmd.push_str(server);
+    }
+
+    let mut child: Option<(HANDLE, DWORD)> = None;
+    let mut launch_fail_count = 0u32;
+    loop {
+        let active = unsafe { WTSGetActiveConsoleSessionId() };
+        let alive = match child {
+            Some((h, _)) => unsafe { WaitForSingleObject(h, 0) } == WAIT_TIMEOUT,
+            None => false,
+        };
+        if active != 0xFFFF_FFFF {
+            let session_changed = matches!(child, Some((_, s)) if s != active);
+            if !alive || session_changed {
+                if let Some((h, s)) = child.take() {
+                    log::info!(
+                        "session watcher: killing child of session {s} (alive={alive}, active={active})"
+                    );
+                    unsafe {
+                        TerminateProcess(h, 0);
+                        WaitForSingleObject(h, 5_000);
+                        CloseHandle(h);
+                    }
+                }
+                match launch_privileged_process(active, &cmd) {
+                    Ok(h) if !h.is_null() => {
+                        launch_fail_count = 0;
+                        if !job.is_null() && unsafe { AssignProcessToJobObject(job, h) } == 0 {
+                            log::warn!(
+                                "session watcher: AssignProcessToJobObject failed gle={}",
+                                scm_last_error()
+                            );
+                        }
+                        log::info!("session watcher: launched session server in session {active}");
+                        child = Some((h, active));
+                    }
+                    _ => {
+                        launch_fail_count += 1;
+                        // A persistent failure (e.g. winlogon not up yet right after
+                        // boot) must not spam the log every poll.
+                        if launch_fail_count == 1 || launch_fail_count % 30 == 0 {
+                            log::warn!(
+                                "session watcher: launch into session {active} failed (streak {launch_fail_count})"
+                            );
+                        }
+                    }
+                }
+            }
+        } else if let Some((h, s)) = child.take() {
+            log::info!("session watcher: no active session, killing child of session {s}");
+            unsafe {
+                TerminateProcess(h, 0);
+                WaitForSingleObject(h, 5_000);
+                CloseHandle(h);
+            }
+        }
+        // Sleep, but wake promptly when the child dies so a restart is not delayed.
+        match child {
+            Some((h, _)) => {
+                unsafe { WaitForSingleObject(h, 2_000) };
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(2_000)),
+        }
+    }
 }
 
 /// Entry point for `--service-headless`: hands the main thread to the SCM service

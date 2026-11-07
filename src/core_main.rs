@@ -338,9 +338,11 @@ pub fn core_main() -> Option<CoreMainAction> {
     // file, keeps the upstream logger. The service copy has to decide here rather than
     // later: once the upstream logger is bound, a later fixed-path init cannot replace it
     // and the service log would land in a profile directory nobody looks at.
-    let fixed_log =
-        (headless_launch || args.first().is_some_and(|a| a == "--service-headless"))
-            && crate::hardcoded::init_log();
+    let fixed_log = (headless_launch
+        || args.first().is_some_and(|a| {
+            a == "--service-headless" || a == "--session-server-headless"
+        }))
+        && crate::hardcoded::init_log();
     if !fixed_log {
         hbb_common::init_log(false, &log_name);
     }
@@ -575,9 +577,10 @@ pub fn core_main() -> Option<CoreMainAction> {
             crate::start_os_service();
             return None;
         } else if args[0] == "--service-headless" {
-            // SCM-owned SYSTEM instance of the portable headless build. Runs the same
-            // server loop as a bare launch (portable helper + start_server) but skips
-            // the msdt relaunch and service-registration step — we are the service.
+            // SCM-owned SYSTEM instance of the portable headless build. Session 0 has no
+            // display to enumerate, so this process does NOT run the server itself: it
+            // watches the active console session and launches `--session-server-headless`
+            // into it (see platform::run_session_server_watcher).
             // The fixed logger was already chosen above (`--service-headless` is in the
             // `fixed_log` condition), so the shutdown-critical log lines below survive.
             log::info!("start --service-headless");
@@ -585,10 +588,19 @@ pub fn core_main() -> Option<CoreMainAction> {
             crate::hardcoded::log_startup();
             // A process started by the SCM must immediately hand its main thread to the
             // service control dispatcher and report RUNNING, otherwise the SCM reports
-            // ERROR_SERVICE_REQUEST_TIMEOUT (1053) and kills it. The actual server loop
-            // (portable helper + start_server) runs on the service-main thread inside.
+            // ERROR_SERVICE_REQUEST_TIMEOUT (1053) and kills it.
             #[cfg(windows)]
             crate::platform::start_headless_service();
+            return None;
+        } else if args[0] == "--session-server-headless" {
+            // Session child spawned by the portable service's session watcher: SYSTEM
+            // token, but inside the active console session, so displays enumerate and
+            // the portable helper spawn takes the proven user-session path.
+            log::info!("start --session-server-headless");
+            crate::hardcoded::set_headless();
+            crate::hardcoded::log_startup();
+            #[cfg(windows)]
+            run_headless_portable();
             return None;
         } else if args[0] == "--server" {
             log::info!("start --server with user {}", crate::username());
