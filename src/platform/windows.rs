@@ -3955,10 +3955,15 @@ fn headless_service_main(_arguments: Vec<OsString>) {
             return;
         }
     };
+    // Accept SHUTDOWN/PRESHUTDOWN as well as STOP: without them the SCM gives no early
+    // warning at reboot, and the watcher keeps relaunching the session child while the
+    // OS is already tearing its session down (observed: 9 relaunches in 1.5s).
     let running_status = ServiceStatus {
         service_type: SERVICE_TYPE,
         current_state: ServiceState::Running,
-        controls_accepted: ServiceControlAccept::STOP,
+        controls_accepted: ServiceControlAccept::STOP
+            | ServiceControlAccept::SHUTDOWN
+            | ServiceControlAccept::PRESHUTDOWN,
         exit_code: ServiceExitCode::Win32(0),
         checkpoint: 0,
         wait_hint: Duration::default(),
@@ -4040,6 +4045,8 @@ pub fn run_session_server_watcher() -> ! {
 
     let mut child: Option<(HANDLE, DWORD)> = None;
     let mut launch_fail_count = 0u32;
+    let mut last_launch = Instant::now();
+    let mut backoff_ms = 0u64;
     loop {
         let active = unsafe { WTSGetActiveConsoleSessionId() };
         let alive = match child {
@@ -4059,9 +4066,20 @@ pub fn run_session_server_watcher() -> ! {
                         CloseHandle(h);
                     }
                 }
+                // A child that dies moments after launch (crash loop, or OS session
+                // teardown during shutdown before our SHUTDOWN control arrives) must
+                // not be relaunched in a tight loop: back off exponentially (1s..8s).
+                // A session change relaunches immediately and resets the backoff.
+                if !session_changed && last_launch.elapsed() < Duration::from_secs(4) {
+                    backoff_ms = (backoff_ms * 2 + 1_000).min(8_000);
+                    std::thread::sleep(Duration::from_millis(backoff_ms));
+                } else {
+                    backoff_ms = 0;
+                }
                 match launch_privileged_process(active, &cmd) {
                     Ok(h) if !h.is_null() => {
                         launch_fail_count = 0;
+                        last_launch = Instant::now();
                         if !job.is_null() && unsafe { AssignProcessToJobObject(job, h) } == 0 {
                             log::warn!(
                                 "session watcher: AssignProcessToJobObject failed gle={}",
