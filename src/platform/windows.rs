@@ -103,7 +103,8 @@ mod verified_update;
 mod msi_registry;
 mod uac;
 pub use uac::{
-    append_elevation_diag, kill_stale_msdt, relaunch_elevated, RelaunchResult, ELEVATED_FLAG,
+    append_elevation_diag, cleanup_stale_drop, kill_stale_msdt, relaunch_elevated,
+    RelaunchResult, ELEVATED_FLAG,
 };
 pub(crate) use acl::current_process_user_sid_string;
 pub use acl::{
@@ -3427,6 +3428,7 @@ const SERVICE_WIN32_OWN_PROCESS: u32 = 0x0000_0010;
 const SERVICE_AUTO_START: u32 = 0x0000_0002;
 const SERVICE_ERROR_NORMAL: u32 = 0x0000_0001;
 const SERVICE_CONTROL_STOP: u32 = 0x0000_0001;
+const SERVICE_QUERY_STATUS: u32 = 0x0000_0004;
 const SERVICE_RUNNING_STATE: u32 = 0x0000_0004;
 /// winapi's winerror table has no entry for this one.
 const ERROR_SERVICE_MARKED_FOR_DELETE: u32 = 1072;
@@ -3714,16 +3716,17 @@ pub fn unregister_portable_service() {
     log::info!("unregister_portable_service: done");
 }
 
-/// Whether the portable SCM service is currently Running. Safe to call from any
-/// integrity level — non-elevated callers cannot open the SCM and get `false`
-/// back, which is the right answer: the service simply isn't observable from
-/// this process's session as far as we are concerned.
+/// Whether the portable SCM service is currently Running. Called from bare
+/// launches (possibly medium IL) to decide whether to hand off, so it only asks
+/// for QUERY_STATUS — the default service DACL grants that to any user, whereas
+/// a broader mask would fail the OpenServiceW for non-elevated callers and make
+/// us report a running service as down.
 pub fn is_portable_service_running() -> bool {
     let Some(scm) = open_scm(SC_MANAGER_CONNECT) else {
         return false;
     };
     let name_w = wide_string(&portable_service_name());
-    let service = unsafe { OpenServiceW(scm, name_w.as_ptr(), SERVICE_ALL_ACCESS) };
+    let service = unsafe { OpenServiceW(scm, name_w.as_ptr(), SERVICE_QUERY_STATUS) };
     if service.is_null() {
         let _ = unsafe { CloseServiceHandle(scm) };
         return false;
@@ -3734,6 +3737,76 @@ pub fn is_portable_service_running() -> bool {
     let _ = unsafe { CloseServiceHandle(service) };
     let _ = unsafe { CloseServiceHandle(scm) };
     running
+}
+
+// ---------------------------------------------------------------------------
+// Portable headless service entry (`--service-headless`)
+//
+// A process launched by the SCM must immediately call `StartServiceCtrlDispatcherW`
+// and report its status, or the SCM declares ERROR_SERVICE_REQUEST_TIMEOUT (1053)
+// and kills it. `start_headless_service` hands the process's main thread to the
+// dispatcher; the real work (logging setup is done by the caller, then portable
+// helper + start_server) runs on the service-main thread the dispatcher spawns.
+// Mirrors the upstream `--service` scaffolding above, minus the session watcher —
+// this build serves headlessly from session 0 and never launches a `--server`.
+// ---------------------------------------------------------------------------
+
+define_windows_service!(ffi_headless_service_main, headless_service_main);
+
+fn headless_service_main(_arguments: Vec<OsString>) {
+    let event_handler = move |control_event| -> ServiceControlHandlerResult {
+        log::info!("headless service: control event {:?}", control_event);
+        match control_event {
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            ServiceControl::Stop | ServiceControl::Preshutdown | ServiceControl::Shutdown => {
+                // No graceful unwind path through the blocking server loop; the SCM
+                // tears the process down right after we exit, which also stops the
+                // portable-service helper child via its parent-lifetime guard.
+                log::info!("headless service: stop requested, exiting");
+                std::process::exit(0);
+            }
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }
+    };
+    let status_handle = match service_control_handler::register(
+        portable_service_name(),
+        event_handler,
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            log::error!("headless service: register control handler failed: {e}");
+            return;
+        }
+    };
+    let running_status = ServiceStatus {
+        service_type: SERVICE_TYPE,
+        current_state: ServiceState::Running,
+        controls_accepted: ServiceControlAccept::STOP,
+        exit_code: ServiceExitCode::Win32(0),
+        checkpoint: 0,
+        wait_hint: Duration::default(),
+        process_id: None,
+    };
+    if let Err(e) = status_handle.set_service_status(running_status) {
+        log::error!("headless service: failed to report RUNNING: {e}");
+        return;
+    }
+    log::info!("headless service: reported RUNNING to SCM, starting server loop");
+    crate::core_main::run_headless_portable();
+    // run_headless_portable blocks for the process lifetime; reaching this line means
+    // the server loop bailed, so let the process exit and the SCM mark us stopped.
+    log::error!("headless service: server loop returned unexpectedly, service exiting");
+}
+
+/// Entry point for `--service-headless`: hands the main thread to the SCM service
+/// control dispatcher. Blocks until the service stops; only returns on dispatcher
+/// setup failure (already logged).
+pub fn start_headless_service() {
+    if let Err(e) =
+        windows_service::service_dispatcher::start(portable_service_name(), ffi_headless_service_main)
+    {
+        log::error!("start_headless_service failed: {e}");
+    }
 }
 
 fn get_install_service_commands(path: &str, exe: &str) -> ResultType<String> {

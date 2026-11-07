@@ -138,6 +138,7 @@ pub fn core_main() -> Option<CoreMainAction> {
         .any(|arg| arg == crate::platform::ELEVATED_FLAG)
     {
         crate::platform::kill_stale_msdt();
+        crate::platform::cleanup_stale_drop();
     }
     // Accepted anywhere so `-force --server-ip <host>` and `--server-ip <host> -force` work
     // alike; it is dropped from the argument list below.
@@ -582,7 +583,12 @@ pub fn core_main() -> Option<CoreMainAction> {
             log::info!("start --service-headless");
             crate::hardcoded::set_headless();
             crate::hardcoded::log_startup();
-            run_headless_portable();
+            // A process started by the SCM must immediately hand its main thread to the
+            // service control dispatcher and report RUNNING, otherwise the SCM reports
+            // ERROR_SERVICE_REQUEST_TIMEOUT (1053) and kills it. The actual server loop
+            // (portable helper + start_server) runs on the service-main thread inside.
+            #[cfg(windows)]
+            crate::platform::start_headless_service();
             return None;
         } else if args[0] == "--server" {
             log::info!("start --server with user {}", crate::username());
@@ -1067,7 +1073,7 @@ fn is_root() -> bool {
 /// portable-service helper when the current copy is elevated (or running as SYSTEM),
 /// then hands over to `start_server`. Callers set up logging and headless markers
 /// before coming here; this function is deliberately thin.
-fn run_headless_portable() {
+pub(crate) fn run_headless_portable() {
     #[cfg(windows)]
     if !crate::platform::is_installed() && crate::platform::is_elevated(None).unwrap_or(false) {
         use crate::portable_service::client;

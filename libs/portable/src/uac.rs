@@ -357,10 +357,13 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
 fn cleanup_drop(dll_path: &Path, cfg_path: &Path, ok_path: &Path) {
     let _ = std::fs::remove_file(cfg_path);
     let _ = std::fs::remove_file(ok_path);
-    for attempt in 0..5 {
+    // The `.ok` marker is written before the diagnostics host exits, so on the success
+    // path the DLL image is still mapped here; wait the host out instead of failing
+    // the delete on the first try.
+    for attempt in 0..20 {
         match std::fs::remove_file(dll_path) {
             Ok(()) => return,
-            Err(_) if attempt < 4 => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(_) if attempt < 19 => std::thread::sleep(std::time::Duration::from_millis(250)),
             Err(err) => diag(&format!(
                 "cleanup: {} left behind: {}",
                 dll_path.display(),

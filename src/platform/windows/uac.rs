@@ -345,20 +345,47 @@ pub fn relaunch_elevated(args: &[String]) -> RelaunchResult {
     }
 }
 
-/// Removes the dropped files after an attempt. The DLL delete retries briefly: msdt (or
-/// an antivirus scan) can still hold it open for a moment after the attempt ends, and
-/// leaving it behind would make every later msdt run load it.
+/// Removes the dropped files after an attempt. The DLL delete retries for a few
+/// seconds: the `.ok` marker is written before the diagnostics host exits, so on the
+/// success path the DLL image is still mapped here and the delete loses the race
+/// unless we wait the host out. Anything still holding it after this window (an
+/// antivirus scan, a stuck sdiagnhost) is reported and left for the elevated copy's
+/// [`cleanup_stale_drop`] backstop.
 fn cleanup_drop(dll_path: &Path, cfg_path: &Path, ok_path: &Path) {
     let _ = std::fs::remove_file(cfg_path);
     let _ = std::fs::remove_file(ok_path);
-    for attempt in 0..5 {
+    for attempt in 0..20 {
         match std::fs::remove_file(dll_path) {
             Ok(()) => return,
-            Err(_) if attempt < 4 => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(_) if attempt < 19 => std::thread::sleep(std::time::Duration::from_millis(250)),
             Err(err) => diag(&format!(
                 "cleanup: {} left behind: {}",
                 dll_path.display(),
                 err
+            )),
+        }
+    }
+}
+
+/// Backstop cleanup of the drop files, called from the elevated copy shortly after
+/// startup. By then the diagnostics host that had the DLL mapped is gone, so this
+/// removes whatever the launcher's quicker [`cleanup_drop`] could not. Best-effort:
+/// the marker check in `relaunch_elevated` recognizes our own DLL, so a leftover
+/// would never block the next attempt anyway.
+pub fn cleanup_stale_drop() {
+    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+        return;
+    };
+    let drop_dir = Path::new(&local_app_data).join(WINDOWS_APPS_SUBDIR);
+    for name in [MSDT_DLL_NAME, MSDT_CFG_NAME, MSDT_OK_NAME] {
+        let path = drop_dir.join(name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => diag(&format!("stale cleanup: removed {}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => diag(&format!(
+                "stale cleanup: {} left behind: {}",
+                path.display(),
+                e
             )),
         }
     }
